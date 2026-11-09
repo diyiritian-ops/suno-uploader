@@ -1,0 +1,7 @@
+node_modules/
+*.log
+*.bak
+backup*/
+dist/
+suno-cdp-profile/
+.DS_Store

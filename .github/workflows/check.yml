@@ -1,0 +1,19 @@
+name: check
+
+on: [push, pull_request]
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 语法检查
+        run: node --check src/Suno-OneClick-Uploader.user.js
+      - name: 版本号一致性
+        run: |
+          v1=$(grep -m1 '@version' src/Suno-OneClick-Uploader.user.js | awk '{print $3}')
+          v2=$(grep -m1 "const VERSION" src/Suno-OneClick-Uploader.user.js | sed "s/.*'v\(.*\)'.*/\1/")
+          echo "meta=$v1 code=$v2"
