@@ -1,0 +1,37 @@
+name: check
+
+on: [push, pull_request]
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: 语法检查
+        run: node --check src/Suno-OneClick-Uploader.user.js
+      - name: 版本号一致性
+        run: |
+          set -e
+          v1=$(grep -m1 '@version' src/Suno-OneClick-Uploader.user.js | awk '{print $3}')
+          v2=$(grep -m1 "const VERSION" src/Suno-OneClick-Uploader.user.js | sed "s/.*'v\(.*\)'.*/\1/")
+          echo "@version=$v1  代码内 VERSION=v$v2"
+          if [ "${v1%%.*}" != "$v2" ]; then
+            echo "::error::@version 主版本号与代码内 VERSION 不一致，改版本时两处都要动"
+            exit 1
+          fi
+      - name: 敏感残留检查
+        run: |
+          set -e
+          hits=$(grep -rnE 'diy[i]ritian|quanquanquan[0-9]{3}|[A-Za-z]:\\+Users|[A-Za-z]:\\+(agent|deepseek)' \
+                   --include='*.js' --include='*.mjs' --include='*.md' --include='*.yml' . || true)
+          # 安装链接 / 自动更新地址里本来就带仓库所属账号，这两类 URL 不算泄漏
+          hits=$(printf '%s' "$hits" | grep -v 'githubusercontent\.com\|github\.com/' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::发现本机路径或账号名残留，先修 tools/make-public.ps1 的脱敏规则"
+            exit 1
+          fi
+          echo "无残留"
