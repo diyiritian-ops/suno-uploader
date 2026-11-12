@@ -9,7 +9,7 @@
 3. 打开 <https://suno.com> 登录并刷新，右下角出现小球即成功
 4. 改代码后：重新导入一次，刷新页面
 
-想自动化一点，可以用仓库自带的两个工具：
+想自动化一点，可以用仓库自带的三个工具：
 
 ```bash
 # 本地 CDP 代理：给脚本调试 / 截图 / 注入用
@@ -17,14 +17,32 @@ node tools/cdp-proxy.mjs --port 3456 --cdp-port 9222
 
 # 静态服务：让 Tampermonkey 从 URL 安装，省得每次拖文件
 node tools/serve.mjs ./dist 3457
+
+# 仓库自检：语法 / 版本 / 残留 / 占位符 / README 链接
+node tools/check.mjs
 ```
 
 ## 提交前
 
-- `node --check src/Suno-OneClick-Uploader.user.js` 必须通过
-- `@version` 和代码里的 `const VERSION` 保持一致
-- 改 UI 的话，附一张改动前后的截图
-- 不要提交本机路径、账号名、真实项目 ID（CI 不查这些，靠自觉）
+一条命令跑完所有检查（不需要联网、不需要 GitHub 权限）：
+
+```bash
+node tools/check.mjs
+```
+
+它查五件事，任何一项不过就退出码 1：
+
+| 检查 | 内容 |
+|---|---|
+| 语法 | 主脚本 + `tools/*.mjs` 的 `node --check` |
+| 版本号 | `// @version` 的主版本号 == 代码里的 `const VERSION` |
+| 残留 | 本机用户目录路径、真实账号名、明文 token |
+| 占位符 | `**点这个链接就能装：** https://raw.githubusercontent.com/diyiritian-ops/suno-uploader/main/src/Suno-OneClick-Uploader.user.js
+
+（Tampermonkey 会自己弹安装页。装好之后它会跟着 main 分支自动检查更新。）` 之类的发布占位没替换干净 |
+| 链接 | README 里引用的相对路径文件是否存在 |
+
+另外：改 UI 的话附一张改动前后的截图；一个 PR 只做一件事。
 
 ## 代码约定
 
