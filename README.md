@@ -1,5 +1,7 @@
 # Suno 一键上传器
 
+[![版本](https://img.shields.io/github/v/release/diyiritian-ops/suno-uploader?label=%E7%89%88%E6%9C%AC&color=7c3aed)](https://github.com/diyiritian-ops/suno-uploader/releases) [![下载量](https://img.shields.io/github/downloads/diyiritian-ops/suno-uploader/total?label=%E4%B8%8B%E8%BD%BD&color=7c3aed)](https://github.com/diyiritian-ops/suno-uploader/releases) [![License](https://img.shields.io/github/license/diyiritian-ops/suno-uploader?color=7c3aed)](LICENSE)
+
 **干一件事：把你电脑里的音频塞进 Suno，自动切成小段传上去，在 Studio 里拼回一整首歌。**
 
 现场录音、手机录的小样、自己混好的成品、伴奏 —— 只要你的播放器能放，它就能处理。

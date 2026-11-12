@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 装不上 / 右下角没圆球 / 上传全红
+    url: https://github.com/diyiritian-ops/suno-uploader/blob/main/README.md
+    about: 90% 的问题在 README 的「装完没反应」和「出问题怎么办」两节里已经写了原因和做法
+  - name: 下载最新版 / 看更新记录
+    url: https://github.com/diyiritian-ops/suno-uploader/releases/latest
+    about: 每次更新都会发 Release，直接下里面的 Suno-OneClick-Uploader.user.js
