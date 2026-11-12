@@ -2,9 +2,11 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    github.suno-tools.uploader
-// @version      30.0.0
+// @version      30.0.1
 // @description  把手头的音频切段批量导入 Suno，在 Studio 里拼成完整作品并导出；附 listen-and-rank 自动评分。
 // @description:en  Batch-import your own audio into Suno Studio, merge into a full track, export; plus listen-and-rank auto rating.
+// @updateURL    https://raw.githubusercontent.com/diyiritian-ops/suno-uploader/main/src/Suno-OneClick-Uploader.user.js
+// @downloadURL  https://raw.githubusercontent.com/diyiritian-ops/suno-uploader/main/src/Suno-OneClick-Uploader.user.js
 // @author       suno-tools
 // @license      MIT
 // @match        https://suno.com/*
@@ -56,7 +58,7 @@
 
   function readToken() {
     const m = document.cookie.match(/(?:^|;\s*)__session=([^;]+)/);
-    if (!m) throw new Error('未登录 suno.com');
+    if (!m) throw new Error('还没登录 suno.com：先在 suno.com 右上角登录，然后刷新这个页面再来');
     return decodeURIComponent(m[1]);
   }
 

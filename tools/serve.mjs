@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 // 极简静态服务器：给 Tampermonkey 一个可抓取的 .user.js URL
-const ROOT = process.argv[2] || 'D:\\agent\\deepseek\\suno\\migrate';
+const ROOT = path.resolve(process.argv[2] || '.');
 const PORT = Number(process.argv[3] || 3457);
 
 const MIME = { '.js': 'text/javascript; charset=utf-8', '.txt': 'text/plain; charset=utf-8', '.md': 'text/markdown; charset=utf-8', '.json': 'application/json' };
