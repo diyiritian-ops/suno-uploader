@@ -50,7 +50,7 @@ console.log('\n[2] 版本号');
 const metaVer = (src.match(/^\/\/ @version\s+(\S+)/m) || [])[1] || '';
 const codeVer = (src.match(/const VERSION = '([^']+)'/) || [])[1] || '';
 const metaMajor = metaVer.split('.')[0];
-const codeMajor = codeVer.replace(/^v/, '');
+const codeMajor = codeVer.replace(/^v/, '').split('.')[0];   // v30.5 → 30，与 @version 的主版本对齐
 if (!metaVer || !codeVer) bad('没读到版本号（@version=' + JSON.stringify(metaVer) + ' code=' + JSON.stringify(codeVer) + '）');
 else if (metaMajor !== codeMajor) bad('@version=' + metaVer + ' 与 const VERSION=' + codeVer + ' 主版本不一致，改版本时两处都要动');
 else ok('@version=' + metaVer + '  const VERSION=' + codeVer);
