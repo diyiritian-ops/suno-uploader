@@ -2,7 +2,7 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      31.0.0
+// @version      32.0.0
 // @description  把任意音频切片上传到 Suno，自动移调绕过指纹、合并成完整作品、导出并下载。成品可直接 Cover。附带「听歌赚积分」自动评分。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
@@ -37,7 +37,7 @@
   const SUNO_MIN_UPLOAD = 6;
   const POLL_MS = 2500;
   const MAX_POLL = 40;
-  const VERSION = 'v31';
+  const VERSION = 'v32';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -876,36 +876,35 @@
         ? e.semis
         : (derivedSemis !== null ? derivedSemis : (fallbackSemis || 0));
 
-      // ★ 按【原始时间轴上的绝对位置】摆放，而不是首尾紧排。
-      //   紧排的话只要有一段缺失，后面所有片段都会前移，
-      //   导致整首歌后面全错位（Go West 就是这么坏的）。
-      const startBeats = (typeof e.t0 === 'number' && e.t0 >= 0)
-        ? e.t0 * BPS
-        : cursor;
+      // ★★ v32 核心：按【实际音频长度】首尾相接，不按原始时间轴摆。
+      //   原因：移调 N 半音后每段只剩 sec/2^(N/12) 秒，若仍按 t0 原位置摆，
+      //   段与段之间必然空出 (1-1/2^(N/12))×sec 的静音（实测每 9 秒空 1.6 秒）。
+      //   上游 sunouploader 也是这么做的：拼接时不管原时间轴，导出后再整体反向重采样还原。
+      const gapRatio = sec > 0 ? Math.max(0.1, Math.min(4, realAudio / sec)) : 1;
+      const playSec = sec * gapRatio;                 // 这一段在 Studio 里实际占的长度
+      const playBeats = playSec * BPS;
+      const startBeats = cursor;                      // 紧接上一段，靠 cursor 累积
 
       const c = {
         color: '#FF6A00', fadeInCurve: 1, startBeats: startBeats, mute: false,
         type: 'audio', fadeInBeats: 0,
-        // ★ 必须还原：pitchShiftResample 是重采样 —— 音高↑ 和 时长↓ 是同一个倍数。
-        //   上传 +15 → 6 秒切片只剩 2.52 秒；Studio 给 -15 → 速率 0.42，
-        //   2.52 / 0.42 = 6.0 秒，音高和时长一起回到原样。
-        //   曾误设成 0：不移回去 → 音高多 15 个半音、每段还空 3.5 秒，听起来就是没变回去。
-        transposition: 0,   // v31：Studio 那层不可靠，统一 0
+        // Studio 侧纯 1:1 播放：移调已经烘焙在音频里，不靠 transposition 还原
+        transposition: 0,
         formantCorrection: 0,
         streaming: false,
         amplitude: 1, fadeOutBeats: 0, fadeOutCurve: 1,
-        loop: { endBeats: durBeats, enabled: false, startBeats: 0 },
+        loop: { endBeats: playBeats, enabled: false, startBeats: 0 },
         name: ('00' + (i + 1)).slice(-3) + ' ' + title + ' p' + ('00' + (i + 1)).slice(-3),
-        endBeats: startBeats + durBeats, clipId: e.clipId, readStartBeats: 0,
+        endBeats: startBeats + playBeats, clipId: e.clipId, readStartBeats: 0,
         id: uuid(), asset: { type: 'clip', id: e.clipId }, reversed: false,
-        // ★ warp 必须启用，否则 Studio 不会把音频拉伸到场景长度 → 出现静音
+        // warp 按【实际音频时长】映射到本段占位，避免拉伸也避免留空
         warp: (() => {
-          const w = warpData(padSec, srcSec, durBeats);
+          const w = warpData(padSec, srcSec, playBeats);
           markersRegistry[w.hash] = w.markers;
           return { awaitingAnalysis: false, markersHash: w.hash, enabled: true };
         })()
       };
-      cursor += durBeats;
+      cursor += playBeats;   // 按实际占位累积
       return c;
     });
     return {
@@ -985,14 +984,28 @@
    *   ② 下载加密 m4a 并解密
    *   ③ 重新上传成新 clip
    */
-  async function cleanClip(srcClipId, title, log) {
+  async function cleanClip(srcClipId, title, log, restoreSemis) {
     const L = log || (() => {});
 
     // ①–⑤ 和「下载到本地」共用同一条解密流水线（见 fetchClipAudio）
-    const blob = await fetchClipAudio(srcClipId, L, { rightsTimeout: 20000, mediaTimeout: 90000 });
+    let blob = await fetchClipAudio(srcClipId, L, { rightsTimeout: 20000, mediaTimeout: 90000 });
 
-    // ⑥ 重新上传：生成全新 clip，躲过二次版权审查
-    L('  ⑥ 重新上传...');
+    /* ⑥ ★ v32 核心：把移调还原回来。
+       上传时按 +N 重采样（音高↑、时长↓），整条导出也是同倍率缩短的；
+       这里用 -N 反向重采样：音高降回原调，时长也乘回去 —— 一步同时还原两者，
+       完全不依赖 Studio 的 transposition（那个字段实测不可靠）。 */
+    const semis = Number(restoreSemis) || 0;
+    if (semis !== 0) {
+      L('  ⑥ 反向移调 -' + semis + ' 半音（还原音高与时长）...');
+      const r = await pitchShiftResample(blob, -semis);
+      blob = r.blob;
+      L('      ' + r.seconds.toFixed(1) + 's');
+    } else {
+      L('  ⑥ 未移调，跳过还原');
+    }
+
+    // ⑦ 重新上传：生成全新 clip，躲过二次版权审查
+    L('  ⑦ 重新上传...');
     const up = await uploadSegment(blob, 'clean_' + srcClipId.slice(0, 8) + '.m4a',
       title, 'mp4');
     L('      ✓ 新 clip ' + up.clipId.slice(0, 8));
@@ -3499,10 +3512,15 @@ select.field{cursor:pointer}
           // ★ 清洗：立刻下载重传，避免被二次版权审查删除
           if (doClean) {
             log('');
-            log('=== 清洗（防止被删）===');
-            status('清洗中...', 'run');
+            log('=== 还原 + 清洗 ===');
+            status('还原音高...', 'run');
             try {
-              const cleaned = await cleanClip(exportId, title, log);
+              // 取本批实际用得最多的移调值（二分补漏的段可能不同，取众数）
+              const cnt = {};
+              pieces.forEach(p => { const k = String(p.semis || 0); cnt[k] = (cnt[k] || 0) + 1; });
+              const restoreSemis = Number(Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0] || 0);
+              log('本批移调众数: +' + restoreSemis + ' → 反向重采样 -' + restoreSemis);
+              const cleaned = await cleanClip(exportId, title, log, restoreSemis);
               finalId = cleaned.clipId;
               log('★ 清洗完成: ' + finalId.slice(0, 8));
               log('  这个 clip 不会被动，可直接 Cover');
