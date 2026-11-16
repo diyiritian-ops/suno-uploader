@@ -1,13 +1,11 @@
 // ==UserScript==
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
-// @namespace    github.suno-tools.uploader
-// @version      30.0.1
-// @description  把手头的音频切段批量导入 Suno，在 Studio 里拼成完整作品并导出；附 listen-and-rank 自动评分。
-// @description:en  Batch-import your own audio into Suno Studio, merge into a full track, export; plus listen-and-rank auto rating.
-// @updateURL    https://raw.githubusercontent.com/diyiritian-ops/suno-uploader/main/src/Suno-OneClick-Uploader.user.js
-// @downloadURL  https://raw.githubusercontent.com/diyiritian-ops/suno-uploader/main/src/Suno-OneClick-Uploader.user.js
-// @author       suno-tools
+// @namespace    local.suno.uploader
+// @version      30.5.0
+// @description  把任意音频切片上传到 Suno，自动移调绕过指纹、合并成完整作品、导出并下载。成品可直接 Cover。附带「听歌赚积分」自动评分。
+// @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
+// @author       local
 // @license      MIT
 // @match        https://suno.com/*
 // @match        https://www.suno.com/*
@@ -39,7 +37,7 @@
   const SUNO_MIN_UPLOAD = 6;
   const POLL_MS = 2500;
   const MAX_POLL = 40;
-  const VERSION = 'v30';
+  const VERSION = 'v30.5';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -290,9 +288,9 @@
   }
 
   /**
-   * 强变换：专治 内容识别服务
+   * 强变换：专治 ACRCloud 指纹
    *
-   * 内容识别服务 靠「频谱峰值序列」做匹配。要打断它需要：
+   * ACRCloud 靠「频谱峰值序列」做匹配。要打断它需要：
    *   1. 大幅移调（>2 半音）—— 频谱整体平移，峰值序列全变
    *   2. 频谱扰动 —— 用 BiquadFilter 扫频，破坏局部峰值
    *   3. 轻微变速 —— 时间轴拉伸，打断时序
@@ -397,7 +395,7 @@
    * 拿一个 clip 的明文音频（M4A / AAC）。
    *
    * 流程（TECH-NOTES 第五节）：
-   *   ① POST /api/mango/rights  —— ★ 绝不要带 Authorization，否则拿不到 glt
+   *   ① POST /api/mango/rights  —— ★ 绝不能带 Authorization，否则拿不到 glt
    *   ② seed = SHA-256(glt) → AES-GCM 解包 key / iv（附加数据 = clipId）
    *   ③ GET /api/clip/{id} → media_urls[0]
    *   ④ 拉密文
@@ -863,10 +861,21 @@
       // 场景长度用【原始时长】
       const sec = (e.origDur && e.origDur > 0) ? e.origDur : (e.t1 - e.t0);
       const durBeats = sec * BPS;
-      const semis = (e.semis !== undefined && e.semis !== null)
-        ? e.semis : (fallbackSemis || 0);
       // 上传音频的实际存储时长（移调后变短 + Suno 可能补的静音）
       const srcSec = (e.audioDur && e.audioDur > 0) ? e.audioDur : sec;
+
+      /* ★★ 反向移调必须由【实际发生了多少】反推，不能写死符号。
+         移调 s 半音 = 时长 ÷ 2^(s/12)，所以从两个时长就能算出 s：
+             s = 12 * log2(切片时长 / 存储时长)
+         Studio 用 transposition = -s，播放速率 2^(-s/12)，场景长度正好回到切片时长：
+             scene = srcSec × 2^(s/12) = sec   →  没有空档，速度与原版一致
+         这样上传时用了 +4 / +7 / 二分补漏的临时移调，都能一一还原。 */
+      const derivedSemis = (sec > 0 && srcSec > 0 && Math.abs(srcSec - sec) > 0.02)
+        ? 12 * Math.log2(sec / srcSec)
+        : null;
+      const semis = (derivedSemis !== null)
+        ? derivedSemis
+        : ((e.semis !== undefined && e.semis !== null) ? e.semis : (fallbackSemis || 0));
       const padSec = (e.padDur && e.padDur > 0) ? e.padDur : 0;
 
       // ★ 按【原始时间轴上的绝对位置】摆放，而不是首尾紧排。
@@ -879,7 +888,10 @@
       const c = {
         color: '#FF6A00', fadeInCurve: 1, startBeats: startBeats, mute: false,
         type: 'audio', fadeInBeats: 0,
-        transposition: -semis,
+        // ★ 实测：pitchShiftResample 是「保时长」的移调，上传前后时长不变（|srcSec-sec|<0.02）。
+        //   这时再让 Studio 施加 -semis 只会把速度改成 1.26 倍 → 每段尾部空出 1.8 秒（断音）。
+        //   所以反向移调一律 0：速度 = 原速，缺口 = 0。移调效果已烘焙在上传音频里。
+        transposition: 0,
         formantCorrection: 0,
         streaming: false,
         amplitude: 1, fadeOutBeats: 0, fadeOutCurve: 1,
@@ -963,7 +975,7 @@
    *
    * 原理（逆向自 sunouploader.site）：
    *   Studio 导出得到 type=rendered_context_window 的 clip，
-   *   它会被 Suno 后续审查删除。
+   *   它会被 Suno 二次版权审查删除。
    *
    *   清洗 = 在该 clip 被删之前（约 47 秒窗口），
    *          下载它的明文音频，重新上传成一个新 clip。
@@ -980,7 +992,7 @@
     // ①–⑤ 和「下载到本地」共用同一条解密流水线（见 fetchClipAudio）
     const blob = await fetchClipAudio(srcClipId, L, { rightsTimeout: 20000, mediaTimeout: 90000 });
 
-    // ⑥ 重新上传：生成全新 clip，保持成品稳定
+    // ⑥ 重新上传：生成全新 clip，躲过二次版权审查
     L('  ⑥ 重新上传...');
     const up = await uploadSegment(blob, 'clean_' + srcClipId.slice(0, 8) + '.m4a',
       title, 'mp4');
@@ -1112,6 +1124,7 @@
     const S = {
       on: false, timer: null, busy: false, pending: false,
       rounds: 0, creds: 0, idle: 0, max: 40, navTried: false, lastClick: [0, 0], waitSince: 0,
+      noGain: 0, checkAt: 0, beforeSig: null, skips: 0,
     };
     const L = (m) => { try { h.log(m); } catch (e) {} };
     const S2 = (m, c) => { try { h.state(m, c); } catch (e) {} };
@@ -1128,15 +1141,63 @@
     function muteAll() {
       qa('audio,video').forEach(m => { try { m.muted = true; } catch (e) {} });
     }
+
+    /**
+     * 每段一行。
+     * v30.1：Suno 把 "Clip A" 改成了 "Version A"，选项也从 div 变成了 button。
+     * 这里两种写法都吃，并且只取最内层（否则会匹配到包住两段的父容器）。
+     */
     function rows(d) {
-      return qa(ROW, d).filter(r => /^Clip [AB]/.test(T(r)) &&
+      const all = qa('div', d).filter(r => /^(Clip|Version) [AB]\b/.test(T(r)) &&
         r.querySelector('button[aria-label="Play"],button[aria-label="Pause"]'));
+      return all.filter(r => !all.some(o => o !== r && r.contains(o)));
     }
     function submitBtn(d) {
       return qa('button', d).find(b => /^Submit/i.test(T(b))) || null;
     }
     function opts(d) {
+      // 新版：<button aria-label="Overall Sound: A">Pick A</button>
+      const neo = qa('button[aria-label^="Overall Sound:"]', d);
+      if (neo.length) return neo;
+      // 旧版：<div class="min-w-6">A</div>
       return qa(OPT, d).filter(e => /^(A|B|Neither)$/.test(T(e)));
+    }
+
+    /** 这一题是不是蜜罐：Suno 会塞静音/禁播/标注为 honeypot 的音频 */
+    function trapInfo(d) {
+      const ms = Array.from(d.querySelectorAll('audio,video'));
+      const srcs = ms.map(m => m.currentSrc || m.src || '');
+      const trap = srcs.find(s => /honeypot|forbidden\.webm|\/sil-\d+\.mp3/i.test(s));
+      const dead = ms.some(m => m.error || (m.readyState === 0 && !m.paused));
+      return { trap: trap || null, dead, srcs };
+    }
+
+    /** 跳过这一题（蜜罐、或播不出来） */
+    function skipOne(d) {
+      const b = qa('button', d).find(x => /^Skip(\s|$)/i.test(T(x))) ||
+                qa('button', d).find(x => /Skip project|跳过/i.test(T(x)));
+      if (!b) return false;
+      b.click();
+      return true;
+    }
+
+    /** 点选答案：新版按钮带 aria-label，旧版是 div */
+    function pickOption(el) {
+      if (!el) return false;
+      el.click();
+      return true;
+    }
+
+    /** 读页面上的「积分」「已完成题数」，用来判断提交到底有没被计数 */
+    function readSig() {
+      const b = T(document.body);
+      const c = b.match(/([\d,]+)\s*credits/i);
+      const d = b.match(/(\d+)\s*Tasks completed/i);
+      if (!c && !d) return null;
+      return {
+        credits: c ? parseInt(c[1].replace(/,/g, ''), 10) : null,
+        done: d ? parseInt(d[1], 10) : null,
+      };
     }
 
     /** 资料向导：这题没选就随机选一个，然后点下一步 */
@@ -1173,6 +1234,23 @@
     function step() {
       // 后台标签里计时器会被节流，听歌秒数不涨 —— 这时只等，不算失败
       if (document.hidden) { S2('标签页在后台：切回这个标签才会继续计时', 'run'); return; }
+
+      /* 提交后 2.5 秒核对一次：积分和已完成数都没动，说明这次没被计数。
+         连续 3 次不计数就停 —— 不然会一直空转（实测跑满/被限时就是这样）。 */
+      if (S.checkAt && Date.now() >= S.checkAt) {
+        const now = readSig();
+        if (now && S.beforeSig && now.credits === S.beforeSig.credits && now.done === S.beforeSig.done) {
+          S.noGain++;
+          L('⚠ 第 ' + S.noGain + ' 次提交没有计数（积分/完成数都没变）');
+        } else {
+          S.noGain = 0;
+        }
+        S.checkAt = 0;
+        if (S.noGain >= 3) {
+          stop('连续 3 题提交后积分没变 · 今天可能已跑满或被限制，先停', 'err');
+          return;
+        }
+      }
       const d = dlg();
       muteAll();
 
@@ -1241,37 +1319,76 @@
       const rs = rows(d);
       if (rs.length < 2) { if (++S.idle > 20) stop('评分弹窗结构异常', 'err'); return; }
 
+      /* ★ v30.1：Suno 开始塞蜜罐（静音 / 禁播 / 标注 honeypot 的音频）。
+         这种题根本没有可听的音频，硬答等于自曝自动化 —— 直接跳过。 */
+      if (!S.pending) {
+        const ti = trapInfo(d);
+        if (ti.trap) {
+          // Skip 对蜜罐无效：实测同一题被反复点到（90 秒 99 次）→ 同题 3 次就停
+          if (S.lastTrap === ti.trap) { S.trapRepeat = (S.trapRepeat || 1) + 1; }
+          else { S.lastTrap = ti.trap; S.trapRepeat = 1; }
+          if (S.trapRepeat >= 3) {
+            L('✗ 同一个蜜罐题跳过 ' + S.trapRepeat + ' 次仍未消失');
+            stop('连续遇到蜜罐题，Suno 可能在试探，先停', 'err');
+            return;
+          }
+          S.skips = (S.skips || 0) + 1;
+          const tag = ti.trap.split('/').pop().slice(0, 30);
+          L('⚠ 蜜罐题（' + tag + '），第 ' + S.trapRepeat + ' 次尝试跳过');
+          S2('跳过蜜罐题 · 已跳 ' + S.skips + ' 题', 'run');
+          if (!skipOne(d)) { stop('蜜罐题没有可用的跳过按钮，先停', 'err'); return; }
+          S.lastClick = [0, 0]; S.deadSince = 0;
+          return;
+        }
+        // 音频一直加载不出来（readyState=0 且没报错）→ 9 秒后当作废题跳过
+        if (ti.dead) {
+          if (!S.deadSince) S.deadSince = Date.now();
+          if (Date.now() - S.deadSince > 9000) {
+            S.deadSince = 0;
+            L('⚠ 音频 9 秒没加载出来，跳过');
+            if (skipOne(d)) { S.lastClick = [0, 0]; return; }
+          }
+        } else {
+          S.deadSince = 0;
+        }
+      }
+
       /* ★ 解锁 Submit 需要两个条件同时成立：
-           ① 选了答案（A / B / Neither，选中时 div 会带 bg-accent）
-           ② Clip A、Clip B 各听满约 5 秒
+           ① 选了答案（A / B / Neither，新版选中后按钮会带 aria-pressed / 样式变化）
+           ② 每段听满约 5 秒
          所以先选答案，再去听，最后提交。 */
       const o = opts(d);
       if (!o.length) { if (++S.idle > 20) stop('找不到 A/B 选项', 'err'); return; }
-      const picked = o.some(e => /bg-accent/.test(String(e.className || '')));
+      const picked = o.some(e => /bg-accent/.test(String(e.className || '')) ||
+                                 e.getAttribute('aria-pressed') === 'true' ||
+                                 /Picked/i.test(T(e.parentElement || e)));
       if (!picked && !S.pending) {
         const r0 = Math.random();
         const want = r0 < 0.42 ? 'A' : r0 < 0.84 ? 'B' : 'Neither';
-        (o.find(x => T(x) === want) || o[0]).click();
+        const el = o.find(x => new RegExp(want + '$').test((x.getAttribute('aria-label') || '').trim()) ||
+                               T(x) === want || /Pick ' + want + '/.test(T(x))) || o[0];
+        pickOption(el);
         S2('选择答案 ' + want + '…', 'run');
         return;
       }
 
       /* ★ 关键坑（2026-11 实测）：
          · 每点一次播放，这一段的听歌计数就从 5 重新开始 —— 反复点永远听不完
-         · 所以每段每题只点一次，然后老实等到「Listen for N more seconds」消失
-         · media.muted = true 不影响计数，可以全程不出声 */
-      const need = rs.filter(r => /listen for .*more second|再听\s*\d+\s*秒/i.test(T(r)));
+         · 所以每段每题只点一次，然后老实等到提示消失
+         · media.muted = true 不影响计数，可以全程不出声
+         · 新版文案是 "Listen for 5 seconds more"（和旧版 "5 more seconds" 词序不同） */
+      const need = rs.filter(r => /listen for\s+\d+\s*(?:more\s+)?seconds?|再听\s*\d+\s*秒/i.test(T(r)));
       if (need.length && !S.pending) {
         const r = need[0];
         const idx = rs.indexOf(r);
         if (Date.now() - (S.lastClick[idx] || 0) < 9000) {
-          S2('听 ' + (idx === 0 ? 'Clip A' : 'Clip B') + ' 中…（第 ' + (S.rounds + 1) + ' 题）', 'run');
+          S2('听 ' + (idx === 0 ? 'A' : 'B') + ' 中…（第 ' + (S.rounds + 1) + ' 题）', 'run');
           return;
         }
         const b = r.querySelector('button[aria-label="Play"],button[aria-label="Pause"]');
         if (b) b.click();
         S.lastClick[idx] = Date.now();
-        S2('开始听 ' + (idx === 0 ? 'Clip A' : 'Clip B') + '（第 ' + (S.rounds + 1) + ' 题）', 'run');
+        S2('开始听 ' + (idx === 0 ? 'A' : 'B') + '（第 ' + (S.rounds + 1) + ' 题）', 'run');
         return;
       }
 
@@ -1285,7 +1402,9 @@
         return;
       }
 
+      S.beforeSig = readSig();
       sub.click();
+      S.checkAt = Date.now() + 2500;   // 2.5 秒后核对有没有真的加分
       S.rounds++; S.creds += 5; S.idle = 0; S.pending = false; S.lastClick = [0, 0];
       // 顺手读一下页面上的真实结算状态（会显示 "105 credits +45 pending"）
       const pend = T(document.body).match(/\+\s*(\d+)\s*pending/i);
@@ -1745,7 +1864,7 @@ select.field{cursor:pointer}
       <div class="row"><label>项目名</label><input id="t" class="field" placeholder="默认用文件名"></div>
 
       <div class="grid2">
-        <div class="row"><label>切片(秒)</label><input id="ss" class="field" value="6" title="6 秒最容易提高通过率（Suno 最短上传）"></div>
+        <div class="row"><label>切片(秒)</label><input id="ss" class="field" value="6" title="6 秒最容易过指纹（Suno 最短上传）"></div>
         <div class="row"><label>移调</label><input id="pitch" class="field" value="4" title="+4 保住 19kHz；超过 +7 会明显发闷"></div>
       </div>
 
@@ -2962,7 +3081,7 @@ select.field{cursor:pointer}
       if (c.rr) $('#rr').value = c.rr;
       if (c.cf !== undefined) $('#cf').value = c.cf;
       // v17：这三项用实测最优值，不读旧配置
-      $('#ss').value = 6;      // 6 秒切片最容易提高通过率
+      $('#ss').value = 6;      // 6 秒切片最容易过指纹
       // ★ 移调不能太大：+4 保留 19kHz 带宽，+24 会把 6kHz 以上全砍掉（音质灾难）
       $('#pitch').value = 4;
       // 并发太高容易触发 S3 限流导致请求悬挂，默认 4
@@ -3280,7 +3399,7 @@ select.field{cursor:pointer}
           log('=== 补漏：还有 ' + gaps.length + ' 段不完整 ===');
           log('  ' + gaps.map(s => 'part' + ('00' + s.idx).slice(-3)).join(' '));
 
-          // 用更高的移调再硬试两轮（内容检测主要靠频谱，移调越大越容易过）
+          // 用更高的移调再硬试两轮（指纹检测主要靠频谱，移调越大越容易过）
           // ★ 上限 +7：再高的话 9 秒切片会被压到不足 6 秒，
           //   Suno 就会在前面补静音，反而引入新的错位
           for (let extra = 0; extra < 2 && gaps.length; extra++) {
@@ -3378,7 +3497,7 @@ select.field{cursor:pointer}
           log('渲染完成（' + ((done.metadata && done.metadata.duration) || built.totalSeconds).toFixed(1) + 's）');
           finalId = exportId;
 
-          // ★ 清洗：立刻下载重传，避免被后续审查删除
+          // ★ 清洗：立刻下载重传，避免被二次版权审查删除
           if (doClean) {
             log('');
             log('=== 清洗（防止被删）===');
