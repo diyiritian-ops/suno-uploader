@@ -2,7 +2,7 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      30.7.0
+// @version      31.0.0
 // @description  把任意音频切片上传到 Suno，自动移调绕过指纹、合并成完整作品、导出并下载。成品可直接 Cover。附带「听歌赚积分」自动评分。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
@@ -37,7 +37,7 @@
   const SUNO_MIN_UPLOAD = 6;
   const POLL_MS = 2500;
   const MAX_POLL = 40;
-  const VERSION = 'v30.7';
+  const VERSION = 'v31';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -890,7 +890,7 @@
         //   上传 +15 → 6 秒切片只剩 2.52 秒；Studio 给 -15 → 速率 0.42，
         //   2.52 / 0.42 = 6.0 秒，音高和时长一起回到原样。
         //   曾误设成 0：不移回去 → 音高多 15 个半音、每段还空 3.5 秒，听起来就是没变回去。
-        transposition: -semis,
+        transposition: 0,   // v31：Studio 那层不可靠，统一 0
         formantCorrection: 0,
         streaming: false,
         amplitude: 1, fadeOutBeats: 0, fadeOutCurve: 1,
@@ -1864,7 +1864,7 @@ select.field{cursor:pointer}
 
       <div class="grid2">
         <div class="row"><label>切片(秒)</label><input id="ss" class="field" value="6" title="6 秒最容易过指纹（Suno 最短上传）"></div>
-        <div class="row"><label>移调</label><input id="pitch" class="field" value="4" title="+4 保住 19kHz；超过 +7 会明显发闷"></div>
+        <div class="row"><label>移调</label><input id="pitch" class="field" value="0" title="0 = 完全不动（速度/音高/空档与原版一致）；调大更容易过检，但音高会升高"></div>
       </div>
 
       <details class="adv">
@@ -3082,7 +3082,7 @@ select.field{cursor:pointer}
       // v17：这三项用实测最优值，不读旧配置
       $('#ss').value = 6;      // 6 秒切片最容易过指纹
       // ★ 移调不能太大：+4 保留 19kHz 带宽，+24 会把 6kHz 以上全砍掉（音质灾难）
-      $('#pitch').value = 4;
+      $('#pitch').value = 0;
       // 并发太高容易触发 S3 限流导致请求悬挂，默认 4
       $('#cf').value = 4;
       $('#doExport').checked = true;
@@ -3186,7 +3186,7 @@ select.field{cursor:pointer}
             return [];
           }
         }
-        const semis = pitchSemis + i;
+        const semis = pitchSemis === 0 ? 0 : pitchSemis + i;   // 移调 0 = 绝对保真，重试也不加
         try {
           const base = sliceToWav(audio, t0, t1);
           // ★ 只变速不补时长：音频随移调变短，Studio 用 transposition 拉回来
