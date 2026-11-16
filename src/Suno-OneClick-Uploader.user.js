@@ -2,7 +2,7 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      30.5.0
+// @version      30.6.0
 // @description  把任意音频切片上传到 Suno，自动移调绕过指纹、合并成完整作品、导出并下载。成品可直接 Cover。附带「听歌赚积分」自动评分。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
@@ -37,7 +37,7 @@
   const SUNO_MIN_UPLOAD = 6;
   const POLL_MS = 2500;
   const MAX_POLL = 40;
-  const VERSION = 'v30.5';
+  const VERSION = 'v30.6';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -888,10 +888,11 @@
       const c = {
         color: '#FF6A00', fadeInCurve: 1, startBeats: startBeats, mute: false,
         type: 'audio', fadeInBeats: 0,
-        // ★ 实测：pitchShiftResample 是「保时长」的移调，上传前后时长不变（|srcSec-sec|<0.02）。
-        //   这时再让 Studio 施加 -semis 只会把速度改成 1.26 倍 → 每段尾部空出 1.8 秒（断音）。
-        //   所以反向移调一律 0：速度 = 原速，缺口 = 0。移调效果已烘焙在上传音频里。
-        transposition: 0,
+        // ★ 必须还原：pitchShiftResample 是重采样 —— 音高↑ 和 时长↓ 是同一个倍数。
+        //   上传 +15 → 6 秒切片只剩 2.52 秒；Studio 给 -15 → 速率 0.42，
+        //   2.52 / 0.42 = 6.0 秒，音高和时长一起回到原样。
+        //   曾误设成 0：不移回去 → 音高多 15 个半音、每段还空 3.5 秒，听起来就是没变回去。
+        transposition: -semis,
         formantCorrection: 0,
         streaming: false,
         amplitude: 1, fadeOutBeats: 0, fadeOutCurve: 1,
