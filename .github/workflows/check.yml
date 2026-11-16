@@ -18,7 +18,8 @@ jobs:
           v1=$(grep -m1 '@version' src/Suno-OneClick-Uploader.user.js | awk '{print $3}')
           v2=$(grep -m1 "const VERSION" src/Suno-OneClick-Uploader.user.js | sed "s/.*'v\(.*\)'.*/\1/")
           echo "@version=$v1  代码内 VERSION=v$v2"
-          if [ "${v1%%.*}" != "$v2" ]; then
+          # 只比主版本：@version=30.5.0 与 VERSION=v30.5 视为一致
+          if [ "${v1%%.*}" != "${v2%%.*}" ]; then
             echo "::error::@version 主版本号与代码内 VERSION 不一致，改版本时两处都要动"
             exit 1
           fi
