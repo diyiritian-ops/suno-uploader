@@ -2,7 +2,7 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      30.6.0
+// @version      30.7.0
 // @description  把任意音频切片上传到 Suno，自动移调绕过指纹、合并成完整作品、导出并下载。成品可直接 Cover。附带「听歌赚积分」自动评分。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
@@ -37,7 +37,7 @@
   const SUNO_MIN_UPLOAD = 6;
   const POLL_MS = 2500;
   const MAX_POLL = 40;
-  const VERSION = 'v30.6';
+  const VERSION = 'v30.7';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -864,19 +864,17 @@
       // 上传音频的实际存储时长（移调后变短 + Suno 可能补的静音）
       const srcSec = (e.audioDur && e.audioDur > 0) ? e.audioDur : sec;
 
-      /* ★★ 反向移调必须由【实际发生了多少】反推，不能写死符号。
-         移调 s 半音 = 时长 ÷ 2^(s/12)，所以从两个时长就能算出 s：
-             s = 12 * log2(切片时长 / 存储时长)
-         Studio 用 transposition = -s，播放速率 2^(-s/12)，场景长度正好回到切片时长：
-             scene = srcSec × 2^(s/12) = sec   →  没有空档，速度与原版一致
-         这样上传时用了 +4 / +7 / 二分补漏的临时移调，都能一一还原。 */
-      const derivedSemis = (sec > 0 && srcSec > 0 && Math.abs(srcSec - sec) > 0.02)
-        ? 12 * Math.log2(sec / srcSec)
-        : null;
-      const semis = (derivedSemis !== null)
-        ? derivedSemis
-        : ((e.semis !== undefined && e.semis !== null) ? e.semis : (fallbackSemis || 0));
+      /* ★ 反向移调：优先用【上传时实际用的 semis】（每一段自己记录，二分补漏的段也各记各的）。
+         只有记录缺失时才用时长相除反推 —— 而且必须减掉 Suno 补的头静音，
+         否则 storedDur 里混进了 pad，反推出的 semis 会偏小（实测 +10 只还原了 5 个半音）。 */
       const padSec = (e.padDur && e.padDur > 0) ? e.padDur : 0;
+      const realAudio = Math.max(0.1, srcSec - padSec);
+      const derivedSemis = (e.semis === undefined || e.semis === null) && sec > 0 && Math.abs(realAudio - sec) > 0.02
+        ? 12 * Math.log2(sec / realAudio)
+        : null;
+      const semis = (e.semis !== undefined && e.semis !== null)
+        ? e.semis
+        : (derivedSemis !== null ? derivedSemis : (fallbackSemis || 0));
 
       // ★ 按【原始时间轴上的绝对位置】摆放，而不是首尾紧排。
       //   紧排的话只要有一段缺失，后面所有片段都会前移，
