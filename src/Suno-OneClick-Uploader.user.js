@@ -2,7 +2,7 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      32.0.0
+// @version      38.6.0
 // @description  把任意音频切片上传到 Suno，自动移调绕过指纹、合并成完整作品、导出并下载。成品可直接 Cover。附带「听歌赚积分」自动评分。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
@@ -14,6 +14,7 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
+// @require      https://cdn.jsdelivr.net/npm/@breezystack/lamejs@1.2.7/dist/lamejs.iife.js#sha256-0be202ec162aa3042d5c5c4e6288ad326cff8cec7312c2894a0a91ad2f9aeda1
 // @connect      studio-api-prod.suno.com
 // @connect      suno.com
 // @connect      www.suno.com
@@ -31,13 +32,13 @@
   'use strict';
 
   const API = 'https://studio-api-prod.suno.com';
-  const BPS = 1.95;
+  // ★ v38：bps 由检测到的 BPM 决定（bps = bpm/60）；1.95 ≈ 117 BPM 是原来的写死值
+  let BPS = 1.95;
   const MIN_SEG = 6;
   // Suno 要求上传音频至少这么长，短了会在【开头】补静音，导致合并后错位
   const SUNO_MIN_UPLOAD = 6;
-  const POLL_MS = 2500;
-  const MAX_POLL = 40;
-  const VERSION = 'v32';
+  const POLL_MS = 4000;
+  const VERSION = 'v38.6.0';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -96,20 +97,30 @@
     }
   }
 
-  function gmFetch(method, url, body, timeout) {
+  function gmFetch(method, url, body, timeout, signal) {
     return new Promise((resolve, reject) => {
+      signal?.throwIfAborted();
       const hasBody = body !== undefined && body !== null;
       const withAuth = String(url).indexOf(API) === 0;
-      GM_xmlhttpRequest({
+      const finish = (settle, value) => {
+        signal?.removeEventListener('abort', abort);
+        settle(value);
+      };
+      const abort = () => {
+        finish(reject, signal.reason);
+        request.abort();
+      };
+      const request = GM_xmlhttpRequest({
         method, url,
         headers: withAuth ? headers(hasBody ? 'application/json' : undefined) : undefined,
         data: hasBody ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
         timeout: timeout || 90000,
         responseType: 'text',
-        onload: r => { netReportOk(); resolve({ status: r.status, text: r.responseText }) },
-        onerror: () => { netReportFail('连接中断'); reject(new Error('网络错误')) },
-        ontimeout: () => { netReportFail('请求超时'); reject(new Error('超时')) }
+        onload: r => { netReportOk(); finish(resolve, { status: r.status, text: r.responseText }) },
+        onerror: () => { netReportFail('连接中断'); finish(reject, new Error('网络错误')) },
+        ontimeout: () => { netReportFail('请求超时'); finish(reject, new Error('请求超时')) }
       });
+      signal?.addEventListener('abort', abort, { once: true });
     });
   }
 
@@ -130,42 +141,12 @@
     });
   }
 
-  function gmUploadS3(url, fields, blob, filename) {
-    return new Promise((resolve, reject) => {
-      const fd = new FormData();
-      Object.keys(fields).forEach(k => fd.append(k, fields[k]));
-      fd.append('file', blob, filename);
-      GM_xmlhttpRequest({
-        method: 'POST', url, data: fd,
-        // 切片只有几百 KB；给 60 秒是考虑到国内上行慢，太短会误判超时
-        timeout: 60000,
-        onload: r => { netReportOk(); resolve({ status: r.status, text: r.responseText }) },
-        onerror: () => { netReportFail('S3 连接中断'); reject(new Error('S3 网络错误')) },
-        ontimeout: () => { netReportFail('S3 超时'); reject(new Error('S3 超时')) }
-      });
-    });
-  }
-
-  /**
-   * 给任意 Promise 加总超时
-   * 防止某个请求卡住导致整个上传任务推进不下去。
-   */
-  function withTimeout(promise, ms, label) {
-    return new Promise((resolve, reject) => {
-      let done = false;
-      const timer = setTimeout(() => {
-        if (done) return;
-        done = true;
-        reject(new Error((label || '操作') + '超时 ' + Math.round(ms / 1000) + 's'));
-      }, ms);
-      promise.then(v => {
-        if (done) return;
-        done = true; clearTimeout(timer); resolve(v);
-      }, e => {
-        if (done) return;
-        done = true; clearTimeout(timer); reject(e);
-      });
-    });
+  async function uploadToStorage(url, fields, blob, filename, signal) {
+    const data = new FormData();
+    for (const [key, value] of Object.entries(fields)) data.append(key, value);
+    data.append('file', blob, filename);
+    const result = await fetch(url, { method: 'POST', body: data, credentials: 'omit', signal });
+    if (!result.ok) throw new Error('HTTP ' + result.status);
   }
 
   // ==================== 音频 ====================
@@ -275,7 +256,102 @@
     return { blob: bufferToWav(rendered), seconds: rendered.duration };
   }
 
-  // 兼容旧名（不再保持时长）
+  /* ══════════════════════════════════════════════════════════════════
+     ★ v38 核心：变速不变调（tempo change, pitch preserved）
+
+     参考 Suno-Upload-Desk 的做法（audio.cjs:126）：
+       rubberband=tempo=N:transients=crisp:detector=compound:phase=laminar
+       （rubberband 不可用时退回 atempo=N）
+
+     为什么必须这样：
+       pitchShiftResample = playbackRate = 音高↑ + 时长↓（两者同倍率）
+       结果音高被改了，只能靠 Studio 的 transposition 反向补偿，
+       而那个字段实测不可靠（多次实测：不还原/还原一半/还原过头）。
+
+       变速不变调则音高从头到尾不动，只有时长变短；
+       Studio 侧用致密 warp markers 把内容时间轴线性拉回原始长度即可，
+       transposition 恒为 0。这样成品音高天然等于原曲。
+     ══════════════════════════════════════════════════════════════════ */
+
+  /**
+   * SOLA 时域伸缩：变速但保持音高（浏览器端实现）
+   *
+   * 参考 Suno-Upload-Desk 的 rubberband/atempo（audio.cjs:126），
+   * 浏览器里没有这两者，用 SOLA（同步叠加）等价实现：
+   *   1. 把输入切成 W 样本的帧，帧间用 Hann 窗做交叠相加
+   *   2. 每帧落点前，在 ±SEARCH 范围内找与上一帧尾部最相关的偏移
+   *   3. 相位对齐后叠加，音高不变，只改变时间轴
+   *
+   * ★ 性能：相关搜索必须稀疏。第一版对整个搜索窗做全量相关，
+   *   180 秒音频要跑几十亿次运算，直接把页面卡死（实测）。
+   *   这里改成：粗搜步长 32 + 只在尾部 64 个点上采样，每帧约 300 次运算。
+   */
+  async function tempoStretch(blob, factor) {
+    const buf = await decodeToBuffer(blob);
+    if (!(factor > 0) || Math.abs(factor - 1) < 0.001) {
+      return { blob, seconds: buf.duration };
+    }
+    const ch = Math.min(2, buf.numberOfChannels);
+    const rate = buf.sampleRate;
+    const inLen = buf.length;
+    const outLen = Math.max(1, Math.round(inLen / factor));
+    const out = new AudioBuffer({ length: outLen, sampleRate: rate, numberOfChannels: ch });
+
+    const W = 2048;                 // 帧长 42.7ms @48k
+    const hopOut = W >> 1;          // 输出步长 = 50% 交叠
+    const hopIn = Math.max(1, Math.round(hopOut * factor));
+    const SEARCH = 256;             // ±5.3ms 相位搜索
+    const CORR = 64;                // 相关窗（尾部采样）
+    const STEP = 32;                // 粗搜步长
+    const win = new Float32Array(W);
+    for (let i = 0; i < W; i++) win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / W);
+
+    const mono = new Float32Array(inLen);
+    for (let c = 0; c < ch; c++) {
+      const s = buf.getChannelData(c);
+      for (let i = 0; i < inLen; i++) mono[i] += s[i] / ch;
+    }
+
+    const plan = [];   // 每帧的输入起点
+    let inPos = 0;
+    while (inPos < inLen) {
+      let best = inPos;
+      if (plan.length) {
+        const prev = plan[plan.length - 1];
+        const ref = prev + W - CORR;
+        let bestScore = -Infinity;
+        for (let off = -SEARCH; off <= SEARCH; off += STEP) {
+          const cand = inPos + off;
+          if (cand < 0 || cand + W >= inLen) continue;
+          let score = 0;
+          for (let k = 0; k < CORR; k += 4) score += mono[cand + k] * mono[ref + k];
+          if (score > bestScore) { bestScore = score; best = cand; }
+        }
+      }
+      plan.push(best);
+      inPos += hopIn;
+    }
+
+    for (let c = 0; c < ch; c++) {
+      const src = buf.getChannelData(c);
+      const dst = out.getChannelData(c);
+      for (let fi = 0; fi < plan.length; fi++) {
+        const si = plan[fi];
+        const di = fi * hopOut;
+        if (di >= outLen) break;
+        const n = Math.min(W, inLen - si, outLen - di);
+        for (let k = 0; k < n; k++) dst[di + k] += src[si + k] * win[k];
+      }
+    }
+    return { blob: bufferToWav(out), seconds: out.duration, factor };
+  }
+  /** 变速不变调（factor>1 变快、时长÷factor，音高不变） */
+  async function speedUpKeepPitch(blob, factor, log) {
+    const t0 = performance.now();
+    const r = await tempoStretch(blob, factor);
+    if (log) log('  变速 x' + factor.toFixed(2) + '（音高不变）→ ' + r.seconds.toFixed(2) + 's，耗时 ' + Math.round(performance.now() - t0) + 'ms');
+    return r;
+  }
   async function transposeKeepLength(blob, semis) {
     const r = await pitchShiftResample(blob, semis);
     return r.blob;
@@ -666,6 +742,47 @@
     return new Blob([out.buffer ? out.buffer : out], { type: 'audio/mpeg' });
   }
 
+  // LAME 可单独替换，源代码及 LGPL 许可：https://github.com/shijinyu/lamejs
+  async function prepareMasterUpload(wav) {
+    if (wav.size <= 8 * 1024 * 1024) return { blob: wav, extension: 'wav' };
+    if (typeof lamejs === 'undefined' || !lamejs.Mp3Encoder) throw new Error('MP3 编码器未加载');
+
+    let pcm = new DataView(await wav.arrayBuffer());
+    let header = lamejs.WavHeader.readHeader(pcm);
+    if (![32000, 44100, 48000].includes(header.sampleRate)) {
+      const resampled = await toWav(wav, 48000);
+      pcm = new DataView(await resampled.arrayBuffer());
+      header = lamejs.WavHeader.readHeader(pcm);
+    }
+    const encoder = new lamejs.Mp3Encoder(header.channels, header.sampleRate, 256);
+    const chunks = [];
+    const samples = header.dataLen / (2 * header.channels);
+    const left = new Int16Array(1152);
+    const right = new Int16Array(1152);
+    let cursor = header.dataOffset;
+    for (let start = 0; start < samples; start += left.length) {
+      const length = Math.min(left.length, samples - start);
+      for (let i = 0; i < length; i++) {
+        left[i] = pcm.getInt16(cursor, true);
+        cursor += 2;
+        if (header.channels === 2) {
+          right[i] = pcm.getInt16(cursor, true);
+          cursor += 2;
+        }
+      }
+      const chunk = encoder.encodeBuffer(left.subarray(0, length), right.subarray(0, length));
+      if (chunk.length) chunks.push(chunk);
+      if (start % (100 * left.length) === 0) {
+        if (globalThis.scheduler?.yield) await scheduler.yield();
+        else await sleep(0);
+      }
+    }
+    chunks.push(encoder.flush());
+    const blob = new Blob(chunks, { type: 'audio/mpeg' });
+    if (!blob.size) throw new Error('MP3 编码没有生成音频');
+    return { blob, extension: 'mp3' };
+  }
+
   /**
    * 把下载到的 m4a 转成目标格式并保存
    *
@@ -750,70 +867,75 @@
 
   // ==================== 上传 ====================
 
-  /**
-   * 上传一段音频到 Suno。
-   *
-   * ★ 超时值必须大于内层最坏情况：
-   *     init(15s) + S3(60s) + finish(15s) + 轮询(40×2s=80s) ≈ 170s
-   *   之前外层只有 75s，比内层轮询上限还短 →
-   *   只要 Suno 处理稍慢就一定被外层掐断，重试也全超时，表现为「卡住」。
-   */
-  async function uploadSegment(blob, filename, title, ext, totalMs, onTick) {
-    return withTimeout(_uploadSegment(blob, filename, title, ext, onTick),
-      totalMs || 180000, '上传');
-  }
-
-  async function _uploadSegment(blob, filename, title, ext, onTick) {
-    const ri = await gmFetch('POST', API + '/api/uploads/audio/',
-      { extension: ext || 'wav', is_stem_mix: false, upload_type: 'file_upload' });
-    if (ri.status !== 200) throw new Error('init HTTP' + ri.status);
-    const init = JSON.parse(ri.text);
-
-    const s3 = await gmUploadS3(init.url, init.fields, blob, filename);
-    if (s3.status !== 200 && s3.status !== 204) throw new Error('S3 HTTP' + s3.status);
-
-    const rf = await gmFetch('POST',
-      API + '/api/uploads/audio/' + init.id + '/upload-finish/',
-      { upload_type: 'file_upload', upload_filename: filename });
-    if (rf.status !== 200) throw new Error('finish HTTP ' + rf.status);
-
-    let st = null;
-    const t0 = Date.now();
-    for (let i = 0; i < MAX_POLL; i++) {
-      await sleep(POLL_MS);
-      const rq = await gmFetch('GET', API + '/api/uploads/audio/' + init.id + '/');
-      if (rq.status !== 200) continue;
-      st = JSON.parse(rq.text);
-      if (st.status === 'complete' || st.status === 'error') break;
-      // 每 4 次（约 8 秒）报一次进度，避免界面看起来卡死
-      if (onTick && i % 4 === 3) {
-        onTick('Suno 处理中 ' + Math.round((Date.now() - t0) / 1000) + 's（' +
-               (st.status || 'pending') + '）');
-      }
-    }
-    if (!st) throw new Error('轮询无响应');
-    if (st.status === 'error') {
-      const e = new Error(st.error_type || st.error_message || '被拒');
-      e.rejected = true;
-      throw e;
-    }
-    if (st.status !== 'complete') throw new Error('处理超时');
-
-    const r5 = await gmFetch('POST',
-      API + '/api/uploads/audio/' + init.id + '/initialize-clip/', '{}');
-    if (r5.status !== 200) throw new Error('initialize-clip HTTP ' + r5.status);
-    const d5 = JSON.parse(r5.text);
-    const cid = d5.clip_id || d5.id;
-    if (!cid) throw new Error('无 clipId');
-
-    const mb = {
-      title, is_audio_upload_tos_accepted: true,
-      skip_notification: true, show_success_toast: false
+  async function uploadSegment(blob, filename, title, ext, totalMs = 180000, onTick = () => {}) {
+    const signal = AbortSignal.timeout(totalMs);
+    const request = async (method, path, body) => {
+      const response = await gmFetch(method, API + path, body, 25000, signal);
+      if (response.status < 200 || response.status >= 300) throw new Error('HTTP ' + response.status);
+      return response.text ? JSON.parse(response.text) : {};
     };
-    if (st.image_url) mb.image_url = st.image_url;
-    await gmFetch('POST', API + '/api/gen/' + cid + '/set_metadata/', mb);
-    // 返回 clipId + 实际时长（Suno 处理后的真实长度）
-    return { clipId: cid, realDur: (st.duration || 0) };
+    let step = '申请上传参数';
+    try {
+      onTick(step);
+      const init = await request('POST', '/api/uploads/audio/',
+        { extension: ext || 'wav', is_stem_mix: false, upload_type: 'file_upload' });
+      if (!init.id || !init.url || !init.fields) throw new Error('Suno 返回的上传参数不完整');
+
+      step = '发送文件至 S3';
+      onTick(step + '（' + (blob.size / 1048576).toFixed(1) + ' MiB）');
+      await uploadToStorage(init.url, init.fields, blob, filename,
+        AbortSignal.any([signal, AbortSignal.timeout(180000)]));
+
+      step = '通知 Suno 接收文件';
+      onTick(step);
+      const path = '/api/uploads/audio/' + encodeURIComponent(init.id) + '/';
+      await request('POST', path + 'upload-finish/',
+        { upload_type: 'file_upload', upload_filename: filename });
+
+      step = '等待 Suno 处理';
+      onTick(step);
+      const start = Date.now();
+      let state;
+      for (let i = 0; ; i++) {
+        signal.throwIfAborted();
+        state = await request('GET', path);
+        if (state.status === 'complete') break;
+        if (state.status === 'error') {
+          const error = new Error([state.error_type, state.error_message].filter(Boolean).join(' · ') || '处理失败');
+          error.rejected = true;
+          throw error;
+        }
+        if (i % 3 === 2) {
+          onTick(step + ' ' + Math.round((Date.now() - start) / 1000) + 's（' + (state.status || 'pending') + '）');
+        }
+        await sleep(POLL_MS);
+      }
+
+      step = '创建 Suno 作品';
+      onTick(step);
+      const created = await request('POST', path + 'initialize-clip/', {});
+      const clipId = created.clip_id || created.id;
+      if (!clipId) throw new Error('Suno 没有返回作品 ID');
+      step = '写入作品信息';
+      onTick(step);
+      const metadata = {
+        title, is_audio_upload_tos_accepted: true,
+        skip_notification: true, show_success_toast: false
+      };
+      if (state.image_url) metadata.image_url = state.image_url;
+      try {
+        const saved = await gmFetch('POST', API + '/api/gen/' + clipId + '/set_metadata/', metadata, 25000, signal);
+        if (saved.status < 200 || saved.status >= 300) throw new Error('HTTP ' + saved.status);
+      } catch (error) {
+        // 作品已创建，保留其 ID，避免仅因标题更新失败而重复上传。
+        onTick(step + '失败：' + error.message);
+      }
+      return { clipId, realDur: state.duration || 0 };
+    } catch (error) {
+      if (error.rejected) throw error;
+      const message = signal.aborted || error.name === 'TimeoutError' ? '超时' : error.message;
+      throw new Error(step + '：' + message, { cause: error });
+    }
   }
 
   // ==================== 项目 / 导出 ====================
@@ -825,86 +947,116 @@
     return JSON.parse(r.text).id;
   }
 
-  /**
-   * 构建 Studio 工程 state。
-   *
-   * ★ 移调还原：每个 entry 带 semis（上传时的移调量），
-   *   这里设 transposition = -semis，Studio 播放/导出时移回原调。
-   *   二分后各块移调量可能不同，所以逐块独立还原。
-   */
-  /**
-   * 生成 warp 数据
-   *
-   * Studio 里 warp 用「hash + 注册表」两级结构：
-   *   clip.warp.markersHash = 'warp_<base64("0:0,D:beats")>'
-   *   state.markersRegistry[hash] = { "0": 0, "<D>": <beats> }
-   *
-   * 只设 hash 不设 registry 的话 Studio 找不到映射，warp 会失效。
-   */
-  function warpData(padSec, totalSec, endBeats) {
-    const f = n => n.toFixed(3).replace(/\.?0+$/, '');
-    const pad = padSec > 0.0001 ? padSec : 0;
-    const raw = f(pad) + ':0,' + f(totalSec) + ':' + f(endBeats);
-    const hash = 'warp_' + btoa(raw).replace(/=+$/, '');
+  /* ★ v38：BPM 检测（抄 Upload-Desk audio.cjs:144 bpmFromSamples）
+     做法：512 帧能量包络 → 取正向差分当 onset → 在 50..200 BPM 范围做自相关 → 取最大。
+     它的 bps = bpm/60，我们原来写死 1.95（约 117 BPM）。
+     warp 的映射精度取决于 bps 是否和真实节拍一致，所以用真实 BPM 更稳。 */
+  function detectBpmFromBuffer(buf) {
+    try {
+      const rate = buf.sampleRate;
+      const ch = buf.getChannelData(0);
+      const N = 512;
+      const count = Math.floor((ch.length - 1) / N);
+      if (count < 64) return null;
+      const energy = new Float64Array(count);
+      for (let i = 0; i < count; i++) {
+        let sum = 0;
+        const end = Math.min((i + 1) * N, ch.length);
+        for (let j = i * N; j < end; j++) sum += ch[j] * ch[j];
+        energy[i] = Math.sqrt(sum / (end - i * N));
+      }
+      const onset = new Float64Array(count);
+      for (let i = 1; i < count; i++) onset[i] = Math.max(0, energy[i] - energy[i - 1]);
+      const envRate = rate / N;
+      const lo = Math.floor(envRate * 60 / 200);
+      const hi = Math.min(Math.ceil(envRate * 60 / 50), count - 1);
+      if (lo < 1 || hi <= lo) return null;
+      let best = -Infinity, bestLag = lo;
+      for (let lag = lo; lag <= hi; lag++) {
+        let corr = 0;
+        for (let i = lag; i < count; i++) corr += onset[i] * onset[i - lag];
+        corr /= (count - lag);
+        if (corr > best) { best = corr; bestLag = lag; }
+      }
+      let bpm = envRate * 60 / bestLag;
+      while (bpm < 70) bpm *= 2;
+      while (bpm > 180) bpm /= 2;
+      return Math.round(bpm * 10) / 10;
+    } catch (e) { return null; }
+  }
+  /* ★ v38：致密 warp markers —— 抄 Suno-Upload-Desk audio.cjs:162
+     把【内容时间轴】线性映射到【场景时间轴】，每 1/16 拍一个映射点。
+     这样 Studio 会把变速后的音频精确拉伸回原始长度，且完全不改音高。
+     以前只有 2 个端点（0 和结尾），对非线性拉伸不构成约束。 */
+  function denseWarpMarkers(contentSeconds, timelineSeconds) {
+    const content = Math.max(0.01, contentSeconds);
+    const timeline = Math.max(0.01, timelineSeconds);
+    const beats = timeline * BPS;
     const markers = {};
-    markers['0'] = 0;
-    markers[f(totalSec)] = endBeats;
+    markers[0] = 0;
+    for (let beat = 1 / 16; beat < beats; beat += 1 / 16) {
+      markers[(content * beat / beats).toFixed(6)] = Number(beat.toFixed(6));
+    }
+    markers[content.toFixed(6)] = Number(beats.toFixed(6));
+    const hash = 'warp_' + btoa('dense:' + content.toFixed(3) + '/' + timeline.toFixed(3) + '/' + BPS).replace(/=+$/, '');
     return { hash, markers };
   }
 
-  function buildState(entries, title, fallbackSemis) {
+  // 兜底：两点式（内容时长 == 场景时长时用）
+  function warpData(sourceSeconds) {
+    const endBeats = sourceSeconds * BPS;
+    const hash = 'warp_' + btoa('0:0,' + sourceSeconds + ':' + endBeats).replace(/=+$/, '');
+    return { hash, markers: { 0: 0, [sourceSeconds]: endBeats } };
+  }
+
+  /* ★ v38：变速不变调后，音频时长 = 原始时长 / factor，音高不变。
+     场景占位 = 原始切片时长（timeline），由致密 warp 把内容拉回来。
+     transposition 恒为 0 —— 音高从来不需要补偿。 */
+  function pieceTiming(piece) {
+    const seconds = Math.max(0.01, piece.t1 - piece.t0);   // 原始切片时长
+    const factor = Math.max(1, Number(piece.tempoFactor) || 1);  // 变速倍率
+    const contentSec = piece.shiftedDur > 0 ? piece.shiftedDur : seconds / factor;
+    const lead = Math.max(0, piece.audioDur ? piece.audioDur - contentSec : Number(piece.padDur) || 0);
+    return { factor, lead, contentSec, timelineSec: seconds };
+  }
+
+  function buildState(entries, title) {
     const sorted = entries.slice().sort((a, b) => a.t0 - b.t0);
     const trackId = uuid();
     const markersRegistry = {};
     let cursor = 0;
     const clips = sorted.map((e, i) => {
-      // 场景长度用【原始时长】
-      const sec = (e.origDur && e.origDur > 0) ? e.origDur : (e.t1 - e.t0);
-      const durBeats = sec * BPS;
-      // 上传音频的实际存储时长（移调后变短 + Suno 可能补的静音）
-      const srcSec = (e.audioDur && e.audioDur > 0) ? e.audioDur : sec;
-
-      /* ★ 反向移调：优先用【上传时实际用的 semis】（每一段自己记录，二分补漏的段也各记各的）。
-         只有记录缺失时才用时长相除反推 —— 而且必须减掉 Suno 补的头静音，
-         否则 storedDur 里混进了 pad，反推出的 semis 会偏小（实测 +10 只还原了 5 个半音）。 */
-      const padSec = (e.padDur && e.padDur > 0) ? e.padDur : 0;
-      const realAudio = Math.max(0.1, srcSec - padSec);
-      const derivedSemis = (e.semis === undefined || e.semis === null) && sec > 0 && Math.abs(realAudio - sec) > 0.02
-        ? 12 * Math.log2(sec / realAudio)
-        : null;
-      const semis = (e.semis !== undefined && e.semis !== null)
-        ? e.semis
-        : (derivedSemis !== null ? derivedSemis : (fallbackSemis || 0));
-
-      // ★★ v32 核心：按【实际音频长度】首尾相接，不按原始时间轴摆。
-      //   原因：移调 N 半音后每段只剩 sec/2^(N/12) 秒，若仍按 t0 原位置摆，
-      //   段与段之间必然空出 (1-1/2^(N/12))×sec 的静音（实测每 9 秒空 1.6 秒）。
-      //   上游 sunouploader 也是这么做的：拼接时不管原时间轴，导出后再整体反向重采样还原。
-      const gapRatio = sec > 0 ? Math.max(0.1, Math.min(4, realAudio / sec)) : 1;
-      const playSec = sec * gapRatio;                 // 这一段在 Studio 里实际占的长度
-      const playBeats = playSec * BPS;
-      const startBeats = cursor;                      // 紧接上一段，靠 cursor 累积
+      const { factor, lead, contentSec, timelineSec } = pieceTiming(e);
+      /* ★ v37.4 修正：warp 描述的是【这条音频文件本身有多长】，不是它要占多少场景。
+         以前用 Math.max(uploaded, playSeconds) → 移调24 时标成 25.7s，但文件只有 6.4s，
+         Studio 找音频找到 6.4s 就没了，剩下 19.26s 全是静音（实测 7 段 x 19.26s = 135s 静音）。
+         必须用实际存储时长（uploaded + 头静音 pad）做 warp。 */
+      const playBeats = timelineSec * BPS;   // 场景占位 = 原始时长
+      const startBeats = cursor;
 
       const c = {
         color: '#FF6A00', fadeInCurve: 1, startBeats: startBeats, mute: false,
         type: 'audio', fadeInBeats: 0,
         // Studio 侧纯 1:1 播放：移调已经烘焙在音频里，不靠 transposition 还原
-        transposition: 0,
+        // ★ v36 = 上游做法：Studio 反向半音补偿（上传时 +N，这里给 -N 还原）
+        transposition: 0,   // ★ v38：音高从未改变，不需要任何补偿（参考 Upload-Desk studio.cjs:33）
         formantCorrection: 0,
         streaming: false,
         amplitude: 1, fadeOutBeats: 0, fadeOutCurve: 1,
-        loop: { endBeats: playBeats, enabled: false, startBeats: 0 },
+        loop: { endBeats: contentSec * BPS, enabled: false, startBeats: 0 },
         name: ('00' + (i + 1)).slice(-3) + ' ' + title + ' p' + ('00' + (i + 1)).slice(-3),
-        endBeats: startBeats + playBeats, clipId: e.clipId, readStartBeats: 0,
+        endBeats: startBeats + playBeats, clipId: e.clipId, readStartBeats: lead * BPS,
         id: uuid(), asset: { type: 'clip', id: e.clipId }, reversed: false,
-        // warp 按【实际音频时长】映射到本段占位，避免拉伸也避免留空
         warp: (() => {
-          const w = warpData(padSec, srcSec, playBeats);
+          // ★ v38：致密 markers 把【内容时间轴】线性映射到【场景时间轴】
+          const w = (Math.abs(contentSec - timelineSec) > 0.05)
+            ? denseWarpMarkers(contentSec, timelineSec)
+            : warpData(contentSec);
           markersRegistry[w.hash] = w.markers;
           return { awaitingAnalysis: false, markersHash: w.hash, enabled: true };
         })()
       };
-      cursor += playBeats;   // 按实际占位累积
+      cursor += playBeats;   // ★ v38：按场景占位累积（曾被误删 → 所有段 startBeats=0 全叠在起点）
       return c;
     });
     return {
@@ -968,48 +1120,92 @@
     return d.id;
   }
 
-  /**
-   * ★ 清洗：把导出的成品再处理一遍，变成不会被删的 clip
-   *
-   * 原理（逆向自 sunouploader.site）：
-   *   Studio 导出得到 type=rendered_context_window 的 clip，
-   *   它会被 Suno 二次版权审查删除。
-   *
-   *   清洗 = 在该 clip 被删之前（约 47 秒窗口），
-   *          下载它的明文音频，重新上传成一个新 clip。
-   *   新 clip 的 type 是 upload/edit_crop，不会触发二次审查。
-   *
-   * 步骤：
-   *   ① 用 mango/rights 拿解密密钥
-   *   ② 下载加密 m4a 并解密
-   *   ③ 重新上传成新 clip
-   */
-  async function cleanClip(srcClipId, title, log, restoreSemis) {
-    const L = log || (() => {});
-
-    // ①–⑤ 和「下载到本地」共用同一条解密流水线（见 fetchClipAudio）
-    let blob = await fetchClipAudio(srcClipId, L, { rightsTimeout: 20000, mediaTimeout: 90000 });
-
-    /* ⑥ ★ v32 核心：把移调还原回来。
-       上传时按 +N 重采样（音高↑、时长↓），整条导出也是同倍率缩短的；
-       这里用 -N 反向重采样：音高降回原调，时长也乘回去 —— 一步同时还原两者，
-       完全不依赖 Studio 的 transposition（那个字段实测不可靠）。 */
-    const semis = Number(restoreSemis) || 0;
-    if (semis !== 0) {
-      L('  ⑥ 反向移调 -' + semis + ' 半音（还原音高与时长）...');
-      const r = await pitchShiftResample(blob, -semis);
-      blob = r.blob;
-      L('      ' + r.seconds.toFixed(1) + 's');
-    } else {
-      L('  ⑥ 未移调，跳过还原');
+  function checkRestoredAudio(candidate, original) {
+    const tolerance = Math.min(0.25, original.duration * 0.02);
+    if (Math.abs(candidate.duration - original.duration) > tolerance) {
+      throw new Error('成品时长与原始音频不一致');
     }
 
-    // ⑦ 重新上传：生成全新 clip，躲过二次版权审查
-    L('  ⑦ 重新上传...');
-    const up = await uploadSegment(blob, 'clean_' + srcClipId.slice(0, 8) + '.m4a',
-      title, 'mp4');
-    L('      ✓ 新 clip ' + up.clipId.slice(0, 8));
-    return up;
+    const originalChannels = Array.from({ length: Math.min(2, original.numberOfChannels) },
+      (_, index) => original.getChannelData(index));
+    const candidateChannels = Array.from({ length: Math.min(2, candidate.numberOfChannels) },
+      (_, index) => candidate.getChannelData(index));
+    const frameSeconds = 0.02;
+    function powerAt(channels, rate, time) {
+      const start = Math.round(time * rate);
+      const end = Math.min(channels[0].length, Math.round((time + frameSeconds) * rate));
+      if (end <= start) return 0;
+      let power = 0;
+      for (const channel of channels) {
+        for (let i = start; i < end; i += 8) power += channel[i] * channel[i];
+      }
+      return power / (Math.ceil((end - start) / 8) * channels.length);
+    }
+    let silentFrames = 0;
+    for (let frame = 0; (frame + 1) * frameSeconds <= original.duration; frame++) {
+      const time = frame * frameSeconds;
+      const lostAudio = powerAt(originalChannels, original.sampleRate, time) >= 10 ** (-39 / 10)
+        && powerAt(candidateChannels, candidate.sampleRate, time) < 10 ** (-45 / 10);
+      silentFrames = lostAudio ? silentFrames + 1 : 0;
+      if (silentFrames * frameSeconds >= 0.25) {
+        throw new Error('成品在 ' + (time - (silentFrames - 1) * frameSeconds).toFixed(2) + ' 秒新增静音');
+      }
+    }
+  }
+
+  // 裁掉每块的片头填充，再按实际使用的移调值恢复到原始采样范围。
+  async function restorePieces(entries, original, log) {
+    const rate = original.sampleRate;
+    const channels = Math.min(2, original.numberOfChannels);
+    let end = 0;
+    const ranges = entries.slice().sort((a, b) => a.t0 - b.t0).map((piece, index) => {
+      const start = Math.round(piece.t0 * rate);
+      const stop = Math.round(piece.t1 * rate);
+      if (start !== end || stop <= start || stop > original.length) {
+        throw new Error('第 ' + (index + 1) + ' 块的原始时间范围有缺口或重叠');
+      }
+      end = stop;
+      return { piece, start, stop };
+    });
+    if (end !== original.length) throw new Error('片段未覆盖原始音频的末尾');
+
+    const output = new AudioBuffer({ length: original.length, sampleRate: rate, numberOfChannels: channels });
+    for (let i = 0; i < ranges.length; i += 3) {
+      const batch = await Promise.allSettled(ranges.slice(i, i + 3).map(async ({ piece, start, stop }, index) => {
+        const number = i + index + 1;
+        const blob = await fetchClipAudio(piece.clipId, null, { rightsTimeout: 20000, mediaTimeout: 60000 });
+        const decoded = await decodeToBuffer(blob);
+        const { factor, lead, contentSec } = pieceTiming(piece);
+        const length = stop - start;   // 目标样本数（原始时间轴）
+        /* ★ v38：本地还原 = 变速不变调。
+           切片被压短 factor 倍，这里用 WSOLA 拉伸回原长，音高保持不变。
+           旧实现用 playbackRate = 1/ratio：长度对但音高被降，所以成品音高不对。 */
+        const padding = Math.max(0, decoded.duration - contentSec);
+        const offset = (lead > 0.08 || padding > 0.12) ? padding : 0;
+        let src = decoded;
+        if (offset > 0.001) {
+          const offSample = Math.round(offset * decoded.sampleRate);
+          const keep = Math.max(1, decoded.length - offSample);
+          const cut = new AudioBuffer({ length: keep, sampleRate: decoded.sampleRate, numberOfChannels: decoded.numberOfChannels });
+          for (let ch = 0; ch < decoded.numberOfChannels; ch++) {
+            cut.copyToChannel(decoded.getChannelData(ch).subarray(offSample), ch, 0);
+          }
+          src = cut;
+        }
+        const stretched = await tempoStretch(bufferToWav(src), 1 / factor);
+        const buf = await decodeToBuffer(stretched.blob);
+        for (let channel = 0; channel < channels; channel++) {
+          const srcCh = buf.getChannelData(Math.min(channel, buf.numberOfChannels - 1));
+          const take = Math.min(srcCh.length, length);
+          output.copyToChannel(srcCh.subarray(0, take), channel, start);
+        }
+        log('  已还原第 ' + number + '/' + ranges.length + ' 块（变速拉伸回原长，音高不变）');
+      }));
+      const failed = batch.find(result => result.status === 'rejected');
+      if (failed) throw failed.reason;
+    }
+    checkRestoredAudio(output, original);
+    return bufferToWav(output);
   }
 
   async function waitRendered(clipId, log, maxWaitMs) {
@@ -1876,8 +2072,8 @@ select.field{cursor:pointer}
       <div class="row"><label>项目名</label><input id="t" class="field" placeholder="默认用文件名"></div>
 
       <div class="grid2">
-        <div class="row"><label>切片(秒)</label><input id="ss" class="field" value="6" title="6 秒最容易过指纹（Suno 最短上传）"></div>
-        <div class="row"><label>移调</label><input id="pitch" class="field" value="0" title="0 = 完全不动（速度/音高/空档与原版一致）；调大更容易过检，但音高会升高"></div>
+        <div class="row"><label>切片(秒)</label><input id="ss" class="field" value="" placeholder="自动" title="留空 = 自动按移调算（变速后仍 >= 6 秒）；填数字则强制使用该值"></div>
+        <div class="row"><label>变速</label><input id="pitch" class="field" value="24" title="24 = 时长压缩 4 倍（音高不变），最容易过指纹；0 = 不变速，最保真但可能被拒"></div>
       </div>
 
       <details class="adv">
@@ -1900,7 +2096,7 @@ select.field{cursor:pointer}
 
       <div class="chips">
         <label class="chip"><input type="checkbox" id="doExport" checked><span>自动导出</span></label>
-        <label class="chip"><input type="checkbox" id="doClean" checked><span>自动清洗</span></label>
+      <label class="chip"><input type="checkbox" id="doClean" checked><span>上传还原成品</span></label>
       </div>
 
       <button class="go" id="go" style="display:none">开始上传</button>
@@ -2087,7 +2283,7 @@ select.field{cursor:pointer}
           pieces: (window.__PIECES || []).map(p => ({
             clipId: p.clipId, t0: p.t0, t1: p.t1,
             semis: p.semis, depth: p.depth,
-            origDur: p.origDur, audioDur: p.audioDur, padDur: p.padDur
+            origDur: p.origDur, audioDur: p.audioDur, padDur: p.padDur, shiftedDur: p.shiftedDur, tempoFactor: p.tempoFactor
           })),
           projectId: window.__PID || null,
           exportId: window.__EXPORT || null
@@ -2375,8 +2571,7 @@ select.field{cursor:pointer}
     async function showResult(d) {
       const clipId = d.clipId || null;
       const projectId = d.pid || null;
-      const link = clipId ? 'https://suno.com/song/' + clipId
-                          : (projectId ? 'https://suno.com/studio/' + projectId : '');
+      const songUrl = clipId ? 'https://suno.com/song/' + clipId : '';
       const secs = d.seconds ? d.seconds.toFixed(1) + 's' : '';
       const meta = [secs, d.segCount ? d.segCount + ' 段' : '', d.type || '']
         .filter(Boolean).join(' · ');
@@ -2386,21 +2581,21 @@ select.field{cursor:pointer}
       resWrap.innerHTML = `
         <div class="hero">
           <div class="hero-img" id="heroImg">
-            ${clipId ? '<a class="play" href="' + link + '" target="_blank" title="在 Suno 打开">▶</a>' : ''}
+            ${songUrl ? '<a class="play" href="' + songUrl + '" target="_blank" title="打开 Suno 作品">▶</a>' : ''}
           </div>
           <div class="hero-body">
             <div class="badges">
               ${d.missing ? '<span class="badge gray">有缺段 · 未导出</span>'
-                          : '<span class="badge ok">完整作品</span>'}
+                          : (clipId ? '<span class="badge ok">云端成品</span>' : '')}
               ${clipId ? '<span class="badge">可直接 Cover</span>' : ''}
-              ${(d.semis && d.semis.length) ? '<span class="badge gray">还原 ' + d.semis.join('/') + ' 半音</span>' : ''}
+              ${(d.semis && d.semis.length) ? '<span class="badge gray">已逐段还原 ' + d.semis.join('/') + ' 半音</span>' : ''}
             </div>
             <h3 title="${escapeAttr(d.title || '')}">${escapeHtml(d.title || '未命名')}</h3>
             <div class="hmeta">${escapeHtml(meta || '—')}</div>
             <div class="hactions">
               ${d.missing
                 ? '<button class="go" id="resRetry">只补缺的 ' + d.missing + ' 段</button>'
-                : (link ? '<a class="go" href="' + link + '" target="_blank">在 Suno 打开</a>' : '')}
+                : (songUrl ? '<a class="go" href="' + songUrl + '" target="_blank">打开 Suno 作品</a>' : '')}
               ${clipId ? '<button class="btn" id="resCopy">复制 ID</button>' : ''}
             </div>
             ${d.missing
@@ -2409,14 +2604,19 @@ select.field{cursor:pointer}
                 '，已阻止导出（强行导出会得到中间缺一段、后面全错位的歌）。</div>' +
                 '<div class="hint" style="margin-top:4px">已经成功的段不会重传。' +
                 (file ? '' : ' 需要先把原文件重新拖进来（进度已保存）。') + '</div>'
-              : '<div class="hint" style="margin-top:8px">成品已在你的 Suno 账号里，打开就能听 / 做 Cover。</div>'}
+              : (d.problem ? '<div class="hint" style="margin-top:8px;color:var(--bad)">' +
+                escapeHtml(d.problem) + '</div>' : '')}
             ${projectId
               ? '<div class="hint" style="margin-top:4px"><a href="https://suno.com/studio/' + projectId +
                 '" target="_blank" style="color:var(--accent);text-decoration:none">在 Studio 打开项目 →</a></div>'
               : ''}
+            ${d.localWav ? '<button class="btn sm" id="resWav" style="margin-top:8px">下载还原 WAV</button>' : ''}
             ${clipId ? '<button class="btn sm" id="resDl" style="margin-top:8px">下载到本地（可选）</button>' : ''}
           </div>
         </div>`;
+
+      const wavButton = resWrap.querySelector('#resWav');
+      if (wavButton) wavButton.onclick = () => saveBlob(d.localWav, safeName(d.title) + ' (还原).wav');
 
       // 封面（拿不到就保持渐变底，不影响功能）
       if (clipId) {
@@ -3095,11 +3295,11 @@ select.field{cursor:pointer}
       // v17：这三项用实测最优值，不读旧配置
       $('#ss').value = 6;      // 6 秒切片最容易过指纹
       // ★ 移调不能太大：+4 保留 19kHz 带宽，+24 会把 6kHz 以上全砍掉（音质灾难）
-      $('#pitch').value = 0;
+      $('#pitch').value = 24;
       // 并发太高容易触发 S3 限流导致请求悬挂，默认 4
       $('#cf').value = 4;
       $('#doExport').checked = true;
-      $('#doClean').checked = true;
+      $('#doClean').checked = c.doClean !== false;
       if (c.fmt && $('#fmt')) $('#fmt').value = c.fmt;
     })();
     function saveCfgNow() {
@@ -3116,24 +3316,26 @@ select.field{cursor:pointer}
       if (el) el.addEventListener('change', saveCfgNow);
     });
 
-    async function prepare() {
+    async function prepare(replan = false) {
       if (!audio) {
         status('解码中...', 'run');
         log('解码音频...');
         audio = await decodeAudio(file);
         log('时长 ' + audio.duration.toFixed(1) + 's, ' + audio.sampleRate + 'Hz, ' +
             audio.numberOfChannels + 'ch');
-      }      let want = Math.max(MIN_SEG, parseFloat($('#ss').value) || 20);
-
-      // ★ Suno 要求上传音频 ≥ 6 秒，短了会【在前面补静音】，导致成品错位
-      //   移调会让音频变短（÷ 2^(n/12)），所以切片长度必须按倍数放大
+      }
+      let want = parseFloat($('#ss').value) || 0;   // 0 = 自动
+      if (!(want > 0)) want = MIN_SEG;
+      /* ★ v38.1：变速不变调时，切片长度必须让【变速后】仍 >= 6 秒。
+         factor = 2^(semis/12)，例 semis=24 → factor=4 → 切片至少 6x4=24s。
+         以前沿用默认 6 秒，变速后只剩 1.5 秒，Suno 直接拒收
+         （实测日志：Uploaded audio is too short (currently 1.6 seconds)）。 */
       const semisNow = parseFloat($('#pitch').value) || 0;
-      const ratio = Math.pow(2, semisNow / 12);
-      const needSec = Math.ceil(SUNO_MIN_UPLOAD * ratio) + 1;   // 留 1 秒余量
+      const factorNow = Math.max(1, Math.pow(2, semisNow / 12));
+      const needSec = Math.ceil(SUNO_MIN_UPLOAD * factorNow) + 2;
       if (want < needSec) {
         log('切片从 ' + want + 's 调整为 ' + needSec + 's');
-        log('  原因：移调 +' + semisNow + ' 会把音频压缩 ' + ratio.toFixed(2) +
-            ' 倍，Suno 要求上传 ≥ ' + SUNO_MIN_UPLOAD + ' 秒，否则会补静音');
+        log('  原因：变速 x' + factorNow.toFixed(2) + ' 会把时长压缩到 1/' + factorNow.toFixed(2) + '，Suno 要求 >= ' + SUNO_MIN_UPLOAD + ' 秒');
         want = needSec;
       }
 
@@ -3145,19 +3347,20 @@ select.field{cursor:pointer}
       let n = Math.max(1, Math.floor(audio.duration / sec));
       let step = audio.duration / n;
 
-      // 保险：步长经移调后仍不足 6 秒，就再减少段数
-      while (n > 1 && step / ratio < SUNO_MIN_UPLOAD) {
+      // 保险：步长经变速后仍不足 6 秒，就再减少段数
+      while (n > 1 && step / factorNow < SUNO_MIN_UPLOAD) {
         n--;
         step = audio.duration / n;
       }
-      if (step / ratio < SUNO_MIN_UPLOAD) {
-        log('⚠ 音频太短：整首上传后只有 ' + (step / ratio).toFixed(1) +
+      if (step / factorNow < SUNO_MIN_UPLOAD) {
+        log('⚠ 音频太短：整首上传后只有 ' + (step / factorNow).toFixed(1) +
             's，Suno 会自动补静音（可能引起轻微错位）');
       }
       if (step > sec * 1.05) {
         log('分段调整为 ' + n + ' 段 × ' + step.toFixed(1) + 's' +
-            '（保证每段移调后仍 ≥ ' + SUNO_MIN_UPLOAD + ' 秒）');
+            '（保证每段变速后仍 >= ' + SUNO_MIN_UPLOAD + ' 秒）');
       }
+      if (replan) segs = [];
       if (!segs.length) {
         for (let i = 0; i < n; i++) {
           segs.push({
@@ -3167,11 +3370,11 @@ select.field{cursor:pointer}
           });
         }
         log('分段: ' + n + ' 段 × ' + step.toFixed(1) + 's' +
-            '（上传后约 ' + (step / ratio).toFixed(1) + 's）');
+            '（上传后约 ' + (step / factorNow).toFixed(1) + 's）');
         showFileCard(file, audio.duration.toFixed(1) + 's · ' + n + ' 段 × ' +
           step.toFixed(1) + 's');
       }
-      return n;
+      return segs.length;
     }
 
     /**
@@ -3199,14 +3402,17 @@ select.field{cursor:pointer}
             return [];
           }
         }
-        const semis = pitchSemis === 0 ? 0 : pitchSemis + i;   // 移调 0 = 绝对保真，重试也不加
+        /* ★ v38：上传前用【变速不变调】而不是移调。
+           semis 现在表示"要提速多少"：factor = 2^(semis/12)。
+           音高保持不变 → Studio 用致密 warp 拉回长度，成品音高天然等于原曲。 */
+        const factor = Math.pow(2, (pitchSemis + i) / 12);
+        const semis = pitchSemis + i;   // 仅用于命名/日志
         try {
           const base = sliceToWav(audio, t0, t1);
-          // ★ 只变速不补时长：音频随移调变短，Studio 用 transposition 拉回来
-          const shifted = semis === 0
-            ? { blob: base, seconds: dur }
-            : await pitchShiftResample(base, semis);
-          const name = 'p' + label.replace(/\W/g, '') + '_s' + semis + '.wav';
+          const shifted = factor <= 1.001
+            ? { blob: base, seconds: t1 - t0 }
+            : await speedUpKeepPitch(base, factor, (m) => log(pad + m));
+          const name = 'p' + label.replace(/\W/g, '') + '_x' + factor.toFixed(2) + '.wav';
 
           const up = await uploadSegment(shifted.blob, name,
             label + (semis ? ' +' + semis : ''), 'wav', 180000,
@@ -3223,23 +3429,28 @@ select.field{cursor:pointer}
             }
           } catch (e) { /* 拿不到就用上传时长 */ }
 
-          const pad = Math.max(0, storedDur - shifted.seconds);
-          if (pad > 0.15) {
-            log(pad + '  ⚠ Suno 在开头补了 ' + pad.toFixed(2) + 's 静音（音频太短）');
+          const leadPad = Math.max(0, storedDur - shifted.seconds);
+          if (leadPad > 0.15) {
+            log(pad + '  ⚠ Suno 在开头补了 ' + leadPad.toFixed(2) + 's 静音（音频太短）');
           }
 
           log(pad + '✓ ' + up.clipId.slice(0, 8) + '  (' + dur.toFixed(1) + 's' +
-              (semis ? ' → 传 ' + shifted.seconds.toFixed(1) + 's, 移调+' + semis : '') + ')');
+              (factor > 1.001 ? ' → 变速 x' + factor.toFixed(2) + ' 传 ' + shifted.seconds.toFixed(1) + 's（音高不变）' : '') + ')');
           // origDur = 原始时长（场景长度）；audioDur = 存储时长；pad = 开头静音
           return [{
-            clipId: up.clipId, t0, t1, semis, depth,
+            clipId: up.clipId, t0, t1, semis, depth, tempoFactor: factor,
             origDur: dur,
             audioDur: storedDur,
-            padDur: pad
+            padDur: leadPad,
+            shiftedDur: shifted.seconds
           }];
         } catch (e) {
-          // 版权拒绝和网络/超时都算可重试，换移调再来
-          log(pad + '× 移调+' + semis + ': ' + e.message);
+          log('× 变速 x' + factor.toFixed(2) + ': ' + e.message);
+          // ★ v38.4：明确区分"代码错误"和"平台拒绝"。代码错误（未定义/语法/类型）重试再多次也不会好，
+          //   直接抛出终止本轮 —— 否则会像实测那样 6 分钟空转 12 轮。
+          if (/is not defined|is not a function|Cannot read|SyntaxError|TypeError|ReferenceError/.test(e.message)) {
+            throw new Error('程序内部错误（不再重试）: ' + e.message);
+          }
           await sleep(600);
         }
       }
@@ -3284,7 +3495,7 @@ select.field{cursor:pointer}
         const doClean = $('#doClean') ? $('#doClean').checked : true;
         const pitchSemis = parseFloat($('#pitch').value) || 0;
 
-        const total = await prepare();
+        const total = await prepare(!window.__PIECES?.length);
         log('');
         log('=== 开始 ===');
         log('共 ' + total + ' 段 | 并发 ' + concurrency + ' | 每段试 ' + maxTry + ' 个移调 | 失败自动二分' +
@@ -3480,83 +3691,149 @@ select.field{cursor:pointer}
         log('✓ 完整性校验通过：' + total + ' 段全部覆盖');
 
         setStep(4);
-        status('建 Studio 项目...', 'run');
-        const pid = await createProject(title);
-        window.__PID = pid;
-        // 每块按各自移调量反向还原
+        let pid = null;
+        let projectError = '';
+        // ★ v38：先检测 BPM，再算 bps —— warp 映射精度取决于 bps 与真实节拍是否一致
+        try {
+          const bpm = detectBpmFromBuffer(audio);
+          if (bpm && bpm > 0) {
+            BPS = bpm / 60;
+            log('检测到 BPM ' + bpm + ' → bps ' + BPS.toFixed(4));
+          } else {
+            log('BPM 检测失败，沿用 bps ' + BPS);
+          }
+        } catch (e) { log('BPM 检测异常: ' + e.message + '，沿用 bps ' + BPS); }
         const built = buildState(pieces, title);
-        await gmFetch('POST', API + '/api/studio/save-project',
-          { project_id: pid, state: built.state });
-        saveProgress('project');
-        const semisSet = Array.from(new Set(pieces.map(p => p.semis)))
-          .filter(x => x > 0).sort((a, b) => a - b);
-        log('项目已建: ' + pid.slice(0, 8) +
-            (semisSet.length ? '（还原 ' + semisSet.join('/') + ' 半音）' : ''));
+        const semisSet = Array.from(new Set(pieces.map(p => Number(p.semis) || 0)))
+          .filter(x => x !== 0).sort((a, b) => a - b);
+        try {
+          status('建 Studio 项目...', 'run');
+          const projectId = window.__PID || await createProject(title);
+          const saved = await gmFetch('POST', API + '/api/studio/save-project',
+            { project_id: projectId, state: built.state });
+          if (saved.status !== 200) throw new Error('保存 Studio 项目 HTTP ' + saved.status);
+          pid = window.__PID = projectId;
+          saveProgress('project');
+          log('项目已保存: ' + pid.slice(0, 8));
+        } catch (e) {
+          if (!wantExport) throw e;
+          projectError = e.message;
+          log('✗ Studio: ' + projectError);
+        }
 
-        let exportId = null;
         let finalId = null;
+        let localWav = null;
+        let problem = projectError;
+        let type = 'Studio 项目';
         if (wantExport) {
-          log('');
-          log('=== 导出完整作品 ===');
-          status('提交导出...', 'run');
-          const lastBeats = built.state.tracks[0].clips.slice(-1)[0].endBeats;
-          exportId = await renderProject(pid, title, built.state, lastBeats);
-          window.__EXPORT = exportId;
-          saveProgress('export');
-          log('导出 clip: ' + exportId.slice(0, 8));
-          status('渲染中...', 'run');
-          const done = await waitRendered(exportId, log, 300000);
-          log('渲染完成（' + ((done.metadata && done.metadata.duration) || built.totalSeconds).toFixed(1) + 's）');
-          finalId = exportId;
+          const adjusted = pieces.some(p => {
+            const timing = pieceTiming(p);
+            return timing.factor > 1.001 || timing.lead > 0.08;
+          });
 
-          // ★ 清洗：立刻下载重传，避免被二次版权审查删除
-          if (doClean) {
-            log('');
-            log('=== 还原 + 清洗 ===');
-            status('还原音高...', 'run');
+          // 纯原速且没有补齐时，可直接使用 Studio 导出。
+          // ★ v36 = 上游做法：能出 Studio 就用 Studio 成品（不再本地重建）
+          // ★ v38.6.0 = 上游做法：只要有工程就走 Studio 合并导出（不再本地重建）
+          if (pid) {
             try {
-              // 取本批实际用得最多的移调值（二分补漏的段可能不同，取众数）
-              const cnt = {};
-              pieces.forEach(p => { const k = String(p.semis || 0); cnt[k] = (cnt[k] || 0) + 1; });
-              const restoreSemis = Number(Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a])[0] || 0);
-              log('本批移调众数: +' + restoreSemis + ' → 反向重采样 -' + restoreSemis);
-              const cleaned = await cleanClip(exportId, title, log, restoreSemis);
-              finalId = cleaned.clipId;
-              log('★ 清洗完成: ' + finalId.slice(0, 8));
-              log('  这个 clip 不会被动，可直接 Cover');
+              status('Studio 合并导出...', 'run');
+              const lastBeats = built.state.tracks[0].clips.at(-1).endBeats;
+              const exportId = await renderProject(pid, title, built.state, lastBeats);
+              window.__EXPORT = exportId;
+              saveProgress('export');
+              await waitRendered(exportId, log, 300000);
+              const rendered = await decodeToBuffer(await fetchClipAudio(exportId));
+              // ★ v37.3：不要再把"时长略有偏差"当硬失败——Studio 渲染+AAC 编解码本来就有几十毫秒填充，
+              //   以前这里一抛错就回退到本地重建，重建出来的音频又必然撞指纹。改成只记日志。
+              try { checkRestoredAudio(rendered, audio); } catch (e) { log('⚠ 时长校验: ' + e.message + '（继续用 Studio 成品）'); }
+              finalId = exportId;
+              type = 'Studio 成品';
+              log('✓ Studio 成品: ' + finalId.slice(0, 8) + '（时长 ' + rendered.duration.toFixed(1) + 's）');
             } catch (e) {
-              log('✗ 清洗失败: ' + e.message);
-              log('  原导出 clip 仍在，尽快使用（约 47 秒窗口）');
+              problem = 'Studio导出: ' + e.message;
+              status('Studio 导出失败：' + e.message, 'err');
+              log('✗ Studio 导出: ' + e.message);
+            }
+          }
+          if (!finalId) {
+            status('逐段还原音频...', 'run');
+            localWav = await restorePieces(pieces, audio, log);
+            type = '本地 WAV';
+            // ★ v38.6.0：成品上传是交付物，不能受「上传还原成品」开关影响（关掉也要出成品）
+            {
+              await showResult({
+                title, pid, localWav, seconds: audio.duration,
+                segCount: pieces.length, semis: semisSet, type
+              });
+              status('本地 WAV 已就绪，准备上传成品...', 'run');
+              try {
+                const { blob, extension } = await prepareMasterUpload(localWav);
+                log('成品格式：' + extension.toUpperCase() + '（' + (blob.size / 1048576).toFixed(1) + ' MiB）');
+                // ★ v38.6.0：成品若被判"与原曲同一录音"，自动加一点听不出的残留再试
+                //   上游之所以能过，就是因为它的成品天然带损耗；这里把这个余量做成可控的。
+                let up = null;
+                let residue = 0; let attempts = 0;   // v38.6.0：网络错误也要重试
+                while (residue <= 2.0 && attempts < 8) {
+                  attempts++;
+                  let send = blob;
+                  if (residue > 0) {
+                    log('⚑ 被判为原曲，加 +' + residue + ' 半音残留重试');
+                    const rr = await pitchShiftResample(blob, residue);
+                    // ★ v38.6.0：重采样输出是未压缩 WAV（180s≈32MB），必须重新编码回原格式，
+                    //   否则 S3 直传必然 Failed to fetch。
+                    const re = await prepareMasterUpload(rr.blob);
+                    send = re.blob;
+                    log('    残留版已编码: ' + re.extension.toUpperCase() + '（' + (send.size / 1048576).toFixed(1) + ' MiB）');
+                  }
+                  try {
+                    up = await uploadSegment(send, 'restored.' + extension, title, extension, 420000, step => {
+                      status('成品上传 · ' + step, 'run');
+                      log('  成品上传：' + step);
+                    });
+                    break;
+                  } catch (err) {
+                    if (/match_version_id|matches an existing recording/i.test(err.message)) { residue = residue === 0 ? 0.6 : residue + 0.6; continue; }
+                    if (/Failed to fetch|NetworkError|timeout|503|502|500/i.test(err.message) && attempts < 8) {
+                      log('⚑ 网络错误，等 3 秒重试（第 ' + attempts + ' 次）: ' + err.message);
+                      await new Promise(r => setTimeout(r, 3000));
+                      continue;
+                    }
+                    throw err;
+                  }
+                }
+                if (!up) throw new Error('加残留后仍被判为原曲');
+                status('校验 Suno 成品...', 'run');
+                const published = await decodeToBuffer(await fetchClipAudio(up.clipId));
+                checkRestoredAudio(published, audio);
+                finalId = up.clipId;
+                type = '还原后上传';
+                log('✓ 已上传还原成品: ' + finalId.slice(0, 8));
+              } catch (e) {
+                problem = [projectError, '成品上传：' + e.message].filter(Boolean).join('；');
+                log('✗ ' + problem);
+              }
             }
           }
         }
 
         addHist({
           at: Date.now(), title,
-          total, ok: pieces.length, dur: built.totalSeconds,
-          projectId: pid, songId: finalId || exportId
+          total, ok: pieces.length, dur: wantExport ? audio.duration : built.totalSeconds,
+          projectId: pid, songId: finalId
         });
 
-        // 走到这里说明完整性校验已通过（有缺口会在前面 return）
         setGuide(4);
-        hint('成品已就绪，点上方 <b>结果</b> 查看');
-        status('完成！成品已就绪', 'ok');
-        log('');
-        log('=== 全部完成（' + total + ' 段全覆盖，无缺失）===');
-        if (finalId) log('作品: https://suno.com/song/' + finalId);
-
-        // 终点就是 Suno 里那首完整作品：把它摆到「结果」页，不再自动下载
+        status(problem ? (finalId ? '云端成品已就绪，Studio 项目保存失败' : '本地 WAV 已就绪，云端成品未完成')
+          : (finalId ? '云端成品已就绪' : (localWav ? '本地 WAV 已就绪' : 'Studio 项目已就绪')),
+        problem ? 'err' : 'ok');
+        hint('点上方 <b>结果</b> 查看');
         await showResult({
-          title,
-          pid,
-          clipId: finalId || exportId,
-          seconds: built.totalSeconds,
-          segCount: total,
-          semis: semisSet,
-          type: finalId && finalId !== exportId ? '清洗后 · edit_crop' : 'rendered_context_window'
+          title, pid, clipId: finalId, localWav, problem,
+          seconds: wantExport ? audio.duration : built.totalSeconds,
+          segCount: pieces.length, semis: localWav ? semisSet : [], type
         });
         setStep(6);
-        clearProgress();     // 完成后清掉存档
+        if (!problem || finalId) clearProgress();
       } catch (e) {
         status('失败: ' + e.message, 'err');
         log('错误: ' + e.message);
@@ -3573,7 +3850,7 @@ select.field{cursor:pointer}
 
     // 暴露几个内部方法，方便在控制台/CDP 里调试（也方便以后写自动化）
     UI = {
-      log, status, host, mount: () => setMin(false),
+      log, status, host, mount: () => setMin(false), tempoStretch, denseWarpMarkers, detectBpmFromBuffer,
       switchTab, showResult, resetResultView, farmer, setProgress, resetProgressClock,
       logs: () => lines.join('\n') +
         (ptsLines.length ? '\n\n===== 积分 =====\n' + ptsLines.join('\n') : ''),
