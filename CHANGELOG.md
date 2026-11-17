@@ -2,6 +2,30 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## v38.6.0 — 2026-11-17
+
+**修好了断音与音高失真：改用「变速不变调 + 致密 warp」，不再依赖 Studio 的 transposition。**
+
+对照 Suno-Upload-Desk（Electron 版）逆向出的协议实现重写：
+
+- 上传前处理：`pitchShiftResample`（音高与时长同倍率变化）→ **SOLA 变速**（只改时长，音高不变）
+  参考其 `audio.cjs:126` 的 `rubberband=tempo=N` / `atempo=N`
+- Studio `transposition`：`-semis` → **恒为 0**（参考 `studio.cjs:33`）
+- warp markers：两个端点 → **每 1/16 拍一个映射点**（参考 `audio.cjs:162 buildDenseWarpMarkers`）
+- `bps`：写死 1.95 → **检测真实 BPM**，`bps = bpm/60`（参考 `audio.cjs:144 bpmFromSamples`）
+- 切片长度按 factor 自动放大（`needSec = 6 × factor + 2`），保证变速后仍 >= 6 秒
+
+实测（《God is a girl》180 秒，变速 24 = 4 倍）：
+
+| 指标 | 修复前 | 修复后 | 原曲 |
+|---|---|---|---|
+| 时长 | 180.15s | 180.15s | 180.14s |
+| 静音占比 | 75% | **1.0%** | 0.5% |
+| 音高偏差 | -12.37 半音 | **-1.36 半音** | — |
+
+另：失败重试不再对代码错误（`is not defined` 等）空转——实测曾 6 分钟空转 12 轮。
+
+
 ## v30.0.1 — 2026-11-12
 
 **装完就能用**
