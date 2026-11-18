@@ -2,8 +2,8 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      38.6.0
-// @description  把任意音频切片上传到 Suno，自动移调绕过指纹、合并成完整作品、导出并下载。成品可直接 Cover。附带「听歌赚积分」自动评分。
+// @version      50.0.0
+// @description  把任意音频切片上传到 Suno，自动移调绕过指纹、本地拼装、Studio 导出成正式作品。成品进入 Suno 作品库可直接 Cover。附带「听歌赚积分」。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
 // @license      MIT
@@ -37,8 +37,26 @@
   const MIN_SEG = 6;
   // Suno 要求上传音频至少这么长，短了会在【开头】补静音，导致合并后错位
   const SUNO_MIN_UPLOAD = 6;
+
+  /* ★ v45：整首移调半音数（24 = 2 个八度，时长压缩 4 倍）
+     段数比原速少 4 倍 → 过审率高；还原在本地拼装阶段做 */
+  /* ★ v49：移调量改成【可在 UI 里调】
+     PITCH 是"本次运行的移调量"，由 #pitch 输入框决定（-24 .. +24）。
+     PITCH_MAX 是允许的绝对值上限。 */
+  const PITCH_MAX = 24;
+  /* ★ v49.1：成品上传专用的固定移调量
+     与用户选的 PITCH 解耦 —— 成品永远带 +24 掩护，
+     否则负移调时（如 -7）chroma 指纹几乎不变，必然被拒。 */
+  const MASTER_PITCH = 24;
+  let PITCH = 24;                     // 默认值，运行时会被 UI 覆盖
+  function setPitch(v) {
+    let n = Math.round(Number(v));
+    if (!Number.isFinite(n)) n = 24;
+    PITCH = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, n));
+    return PITCH;
+  }
   const POLL_MS = 4000;
-  const VERSION = 'v38.6.0';
+  const VERSION = 'v50.0.0';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -890,7 +908,7 @@
       onTick(step);
       const path = '/api/uploads/audio/' + encodeURIComponent(init.id) + '/';
       await request('POST', path + 'upload-finish/',
-        { upload_type: 'file_upload', upload_filename: filename });
+        { upload_type: 'studio_file_upload', upload_filename: filename });
 
       step = '等待 Suno 处理';
       onTick(step);
@@ -916,11 +934,30 @@
       const created = await request('POST', path + 'initialize-clip/', {});
       const clipId = created.clip_id || created.id;
       if (!clipId) throw new Error('Suno 没有返回作品 ID');
+
+      /* ★ v46：验证作品真的落在 Suno 上。
+         踩过的坑：v45 日志显示"创建 Suno 作品"成功，但用返回的 id
+         查 /api/clip/{id} 是 404，作品库里也没有 —— initialize-clip
+         可能返回了 id 而作品尚未落库。这里主动确认。 */
+      step = '验证作品已落库';
+      onTick(step);
+      let exists = false;
+      for (let k = 0; k < 6; k++) {
+        try {
+          const chk = await gmFetch('GET', API + '/api/clip/' + clipId, null, 20000, signal);
+          if (chk.status === 200) { exists = true; break; }
+        } catch (e) { /* 继续等 */ }
+        await sleep(1200);
+      }
+      if (!exists) throw new Error('作品未落库（id=' + clipId.slice(0, 8) + '）');
+
       step = '写入作品信息';
       onTick(step);
+      /* ★ v46：去掉 skip_notification / show_success_toast。
+         这两个参数会让作品"静默创建"，可能不进作品库。
+         sunouploader 的 set_metadata 只有 title + tos，没有这两个。 */
       const metadata = {
-        title, is_audio_upload_tos_accepted: true,
-        skip_notification: true, show_success_toast: false
+        title, is_audio_upload_tos_accepted: true
       };
       if (state.image_url) metadata.image_url = state.image_url;
       try {
@@ -1154,6 +1191,403 @@
   }
 
   // 裁掉每块的片头填充，再按实际使用的移调值恢复到原始采样范围。
+  /* ══════════════════════════════════════════════════════════════════
+     ★ v45 本地拼装（C 方案）
+
+     背景（三次实测）：
+       Studio 的 warp 不做真正"拉长"。上传 7.5s 内容 + 场景 30s，
+       渲染出来还是 7.5s。所以「整首移调 → Studio 拉回」这条路不通。
+
+     sunouploader 的做法：
+       它在自己服务器上把段下载、拼成整条、反向移调，
+       然后作为【新 clip】重传 —— 成品是重传的那个，不是 Studio 渲染的。
+
+     这里在浏览器本地复刻同一套：
+       ① 逐段下载（fetchClipAudio 解密）
+       ② 每段反向移调 −PITCH（音高降回、时长 ×4）
+       ③ 按顺序首尾相接拼成整条
+       ④ 返回整条 WAV blob，供 uploadSegment 重传
+
+     性能：280 秒歌 → 33MB WAV。分 3 个并发下载 + 逐段处理，
+     避免一次性占满内存。实测单段（24 秒）反向移调约 200-400ms。
+     ══════════════════════════════════════════════════════════════════ */
+  /* ★ v47.3：削人声频段（2.8-7.8 kHz）
+
+     依据：suno-uploader 桌面版 C1_ROUNDTRIP 的 dynamic_eq 模块
+     就在这个频段做 3dB 衰减，实测能让人声辅音能量降 53.8%，
+     从而同时打击 ASR（歌词识别）和频谱指纹。
+
+     这里用 Web Audio 的 BiquadFilter 做两级 peaking 衰减。 */
+  /* ★ v50：粉红噪声底（不改时长）
+     依据 suno-uploader 的 C1 noise 模块（-66dBFS，固定种子）。
+     作用：填满频谱空隙，干扰指纹的静音段比对。 */
+  async function addNoiseFloor(blob, levelDb) {
+    const buf = await decodeToBuffer(blob);
+    const ch = buf.numberOfChannels;
+    const rate = buf.sampleRate;
+    const out = new AudioBuffer({ length: buf.length, sampleRate: rate, numberOfChannels: ch });
+    const amp = Math.pow(10, (levelDb || -66) / 20);
+    // 固定种子的伪随机（可复现）
+    let seed = 20261118;
+    const rnd = () => {
+      seed = (seed * 1664525 + 1013904223) >>> 0;
+      return seed / 4294967296 * 2 - 1;
+    };
+    for (let c = 0; c < ch; c++) {
+      const src = buf.getChannelData(c);
+      const dst = new Float32Array(src.length);
+      let pink = 0;
+      const a = 0.995;
+      for (let i = 0; i < src.length; i++) {
+        pink = a * pink + (1 - a) * rnd();
+        dst[i] = src[i] + pink * amp * 3;
+      }
+      out.copyToChannel(dst, c, 0);
+    }
+    return bufferToWav(out);
+  }
+
+  /* ★ v50：微合唱（不改时长）
+     用极短的交叉延迟混合，制造细微的双声像。
+     依据 suno-uploader 的 C1 crossdelay 模块（17/23ms）。 */
+  async function microChorus(blob, log) {
+    const buf = await decodeToBuffer(blob);
+    const ch = buf.numberOfChannels;
+    const rate = buf.sampleRate;
+    const out = new AudioBuffer({ length: buf.length, sampleRate: rate, numberOfChannels: ch });
+    const d1 = Math.round(rate * 0.017);   // 17ms
+    const d2 = Math.round(rate * 0.023);   // 23ms
+    const mix = 0.10;                       // 交叉混入 10%
+    for (let c = 0; c < ch; c++) {
+      const src = buf.getChannelData(c);
+      const other = buf.getChannelData(Math.min(c + 1, ch - 1));
+      const dst = new Float32Array(src.length);
+      for (let i = 0; i < src.length; i++) {
+        const a = i >= d1 ? other[i - d1] : 0;
+        const b = i >= d2 ? other[i - d2] : 0;
+        dst[i] = src[i] + (a + b) * 0.5 * mix;
+      }
+      out.copyToChannel(dst, c, 0);
+    }
+    if (log) log('      ⌁ 已加微合唱（17/23ms 交叉 10%）');
+    return bufferToWav(out);
+  }
+
+  async function cutVocalBand(blob, log, heavy) {
+    const L = log || (() => {});
+    const buf = await decodeToBuffer(blob);
+    const ch = buf.numberOfChannels;
+    const rate = buf.sampleRate;
+    const off = new OfflineAudioContext(ch, buf.length, rate);
+
+    const src = off.createBufferSource();
+    src.buffer = buf;
+
+    // 两级 peaking：3.4k 和 6.2k，各 -4dB
+    const f1 = off.createBiquadFilter();
+    f1.type = 'peaking';
+    f1.frequency.value = 3400;
+    f1.Q.value = 2.0;
+    f1.gain.value = heavy ? -7 : -4;
+
+    const f2 = off.createBiquadFilter();
+    f2.type = 'peaking';
+    f2.frequency.value = 6200;
+    f2.Q.value = 2.0;
+    f2.gain.value = heavy ? -5 : -3;
+
+    src.connect(f1);
+    f1.connect(f2);
+    f2.connect(off.destination);
+    src.start(0);
+
+    const rendered = await off.startRendering();
+    L('      ⌁ 已削人声频段（3.4k ' + (heavy ? -7 : -4) + 'dB / 6.2k ' + (heavy ? -5 : -3) + 'dB）');
+    return bufferToWav(rendered);
+  }
+
+  /* ★ v48.1：裁掉末尾静音
+
+     为什么必须做：Studio 的 transposition 会把音频拉长 4 倍，
+     末尾哪怕只有 3.38s 静音，成品结尾就是 13.5s 空白。
+
+     判定：0.5 秒窗口 RMS < 0.0025 算静音。
+     保留 0.15s 尾巴，避免切到音乐的自然衰减。 */
+  function trimTailSilence(audioBuffer, log) {
+    const L = log || (() => {});
+    const rate = audioBuffer.sampleRate;
+    const ch = audioBuffer.getChannelData(0);
+    const win = Math.floor(rate * 0.5);
+    let end = ch.length;
+
+    for (let k = ch.length - win; k >= 0; k -= win) {
+      let s = 0;
+      for (let q = 0; q < win; q += 16) s += ch[k + q] * ch[k + q];
+      const rms = Math.sqrt(s / (win / 16));
+      if (rms >= 0.0025) { end = Math.min(ch.length, k + win); break; }
+      if (k === 0) end = 0;
+    }
+
+    const keep = Math.max(rate, end + Math.floor(rate * 0.15));
+    if (keep >= ch.length) {
+      L('  末尾无需裁剪');
+      return audioBuffer;
+    }
+
+    const cut = ch.length - keep;
+    L('  裁掉末尾静音 ' + (cut / rate).toFixed(2) + 's（' +
+      (ch.length / rate).toFixed(2) + 's → ' + (keep / rate).toFixed(2) + 's）');
+
+    const chCount = audioBuffer.numberOfChannels;
+    const out = new AudioBuffer({ length: keep, sampleRate: rate, numberOfChannels: chCount });
+    for (let c = 0; c < chCount; c++) {
+      out.copyToChannel(audioBuffer.getChannelData(c).subarray(0, keep), c, 0);
+    }
+    return out;
+  }
+
+  async function assembleWhole(pieces, log, opts) {
+    const o = opts || {};
+    const rate = o.sampleRate || 48000;
+    const chCount = o.channels || 2;
+    const totalSec = o.totalSeconds || 0;
+    const L = log || (() => {});
+
+    const sorted = pieces.slice().sort((a, b) => a.t0 - b.t0);
+    if (!sorted.length) throw new Error('没有可拼装的片段');
+
+    /* 先算出每段的目标样本数（原始时间轴长度） */
+    const ratio = Math.pow(2, PITCH / 12);
+    /* ★ v45：t0/t1 是【压缩后】的时间轴（整首已 +24 移调），
+       每段原始长度 = 压缩长度 × ratio（4）。
+       拼装时按原始长度摆位，反向移调后内容正好填满。 */
+    const segs = sorted.map((p, i) => {
+      const compressedSec = Math.max(0.01, p.t1 - p.t0);   // 压缩后长度
+      /* ★ v45.1：每段可能用了不同移调（补漏会降档重试），
+         所以原始长度要用【这一段自己的 semis】算：
+           rawSec = compressedSec × 2^(semis/12)
+         这样无论 +24 / +7 / +5，还原后都能精确填满。 */
+      /* 目标长度 = 压缩后长度 × 2^(PITCH/12)
+         （整首按 PITCH 压缩，所以原始长度就是 compressed × ratio） */
+      const rawSec = compressedSec * ratio;
+      const targetSamples = Math.round(rawSec * rate);
+      return { p, i, rawSec, targetSamples };
+    });
+
+    const totalSamples = segs.reduce((a, s) => a + s.targetSamples, 0);
+    L('拼装计划：' + segs.length + ' 段，合计 ' + (totalSamples / rate).toFixed(2) + 's');
+
+    const output = new AudioBuffer({
+      length: totalSamples, sampleRate: rate, numberOfChannels: chCount,
+    });
+
+    let cursor = 0;
+    const BATCH = 2;   // 同时处理 2 段，兼顾速度和内存
+    for (let i = 0; i < segs.length; i += BATCH) {
+      const batch = segs.slice(i, i + BATCH);
+      const results = await Promise.allSettled(batch.map(async (s) => {
+        const t0 = performance.now();
+        // ① 下载这一段
+        const blob = await fetchClipAudio(s.p.clipId, null,
+          { rightsTimeout: 20000, mediaTimeout: 90000 });
+        const decoded = await decodeToBuffer(blob);
+
+        /* ★ v45.2：不依赖记录的 semis，直接按【实际内容长度】反推还原量
+
+           为什么：补漏段的 p.semis 记录不可靠。
+           实测：一段记录 semis=+7，但内容只有 5.0s
+                （说明它其实是整首 +24 压缩后再被 Suno 存成 5s）。
+           按 -7 还原 → 5 × 1.5 = 7.5s，目标是 30s，差 22.5s。
+
+           正确做法：下载解码 → 量出实际内容长度 actualSec
+                    需要还原倍数 = targetSec / actualSec
+                    反向移调量 = 12 × log2(倍数)
+           这样不管上传时用了什么移调、Suno 存成多长，都能精确填满目标。 */
+        const actualSec = Math.max(0.01, decoded.duration);
+        const targetSec = s.targetSamples / rate;
+        const needRatio = targetSec / actualSec;
+
+        let buf = decoded;
+        let totalSemis = 0;
+        if (Math.abs(needRatio - 1) > 0.02) {
+          /* ★ v45.4：单次移调限幅 ±24（= 4 倍），超过就【分多次】做。
+             实测需要 4.54 倍 = 26.19 半音，一次 -24 只能 4.00 倍，
+             结果每段差 3.57s。改成循环：
+               每次最多 24 半音，直到累计倍数够了。 */
+          let remaining = needRatio;
+          let cur = bufferToWav(decoded);
+          let guard = 0;
+          while (remaining > 1.02 && guard++ < 4) {
+            const stepRatio = Math.min(remaining, 4.0);      // 每次最多 4 倍
+            const semis = -12 * Math.log2(stepRatio);        // 负数 = 拉长
+            const b = await pitchShiftResample(cur, Math.max(-24, Math.min(24, semis)));
+            cur = b.blob;
+            totalSemis += semis;
+            remaining /= stepRatio;
+          }
+          buf = await decodeToBuffer(cur);
+        }
+
+        const ms = Math.round(performance.now() - t0);
+        L('  第 ' + (s.i + 1) + '/' + segs.length + ' 段：下载 ' + actualSec.toFixed(2) +
+          's → 目标 ' + targetSec.toFixed(2) + 's（×' + needRatio.toFixed(2) +
+          '，累计移调 ' + totalSemis.toFixed(2) + '，' + ms + 'ms）');
+        return { s, buf, totalSemis };
+      }));
+
+      for (const r of results) {
+        if (r.status === 'rejected') throw r.reason;
+        const { s, buf } = r.value;
+        const take = Math.min(buf.length, s.targetSamples);
+        for (let c = 0; c < chCount; c++) {
+          const srcCh = buf.getChannelData(Math.min(c, buf.numberOfChannels - 1));
+          const part = srcCh.subarray(0, take);
+          if (part.length) output.copyToChannel(part, c, cursor);
+        }
+        // 若还原后不足目标长度，剩余部分留静音（不破坏时间轴）
+        if (take < s.targetSamples) {
+          L('  ⚠ 第 ' + (s.i + 1) + ' 段偏短 ' +
+            ((s.targetSamples - take) / rate).toFixed(2) + 's，已用静音补齐');
+        }
+        cursor += s.targetSamples;
+      }
+    }
+
+    /* ★ v47.1：拼装后立即自检静音
+       目的：不下载成品也能确认拼装质量。
+       判定：0.5 秒窗口 RMS < 0.0035 算静音。 */
+    try {
+      const ch0 = output.getChannelData(0);
+      const win = Math.floor(rate * 0.5);
+      let silent = 0, totalWin = 0;
+      const gaps = [];
+      let runStart = -1;
+      for (let k = 0; k + win <= ch0.length; k += win) {
+        let s = 0;
+        for (let q = 0; q < win; q += 16) s += ch0[k + q] * ch0[k + q];
+        const rms = Math.sqrt(s / (win / 16));
+        totalWin++;
+        if (rms < 0.0035) {
+          silent++;
+          if (runStart < 0) runStart = k / rate;
+        } else {
+          if (runStart >= 0) {
+            const len = (k / rate) - runStart;
+            if (len >= 1.0) gaps.push(runStart.toFixed(1) + 's+' + len.toFixed(1) + 's');
+            runStart = -1;
+          }
+        }
+      }
+      if (runStart >= 0) {
+        const len = (ch0.length / rate) - runStart;
+        if (len >= 1.0) gaps.push(runStart.toFixed(1) + 's+' + len.toFixed(1) + 's');
+      }
+      const pct = totalWin ? (100 * silent / totalWin) : 0;
+      L('  自检：静音 ' + pct.toFixed(1) + '%（' + silent + '/' + totalWin + ' 窗口）');
+      if (gaps.length) {
+        L('  ⚠ 静音空档：' + gaps.slice(0, 6).join(', ') + (gaps.length > 6 ? ' …' : ''));
+      } else {
+        L('  ✓ 无 ≥1 秒的静音空档');
+      }
+      window.__ASSEMBLE_QA = { silentPct: pct, gaps, seconds: totalSamples / rate };
+    } catch (e) {
+      L('  ⚠ 自检异常: ' + e.message);
+    }
+
+    L('✓ 整首拼装完成：' + (totalSamples / rate).toFixed(2) + 's');
+    return { blob: bufferToWav(output), seconds: totalSamples / rate, audio: output };
+  }
+
+  /* ══════════════════════════════════════════════════════════════════
+     ★ v46：把整首 clip 做成 Studio 工程并导出 —— 这是进作品库的正路
+
+     依据 sunouploader 教程原文：
+       「本站会把已完成的切片按原始时间线拼回一首完整歌曲，
+         再调用 Suno 创建 Studio 工程并提交导出」
+
+     为什么需要这一步：
+       直接上传的 clip（type='upload'）虽然也在库里，
+       但它不是"Studio 成品"，不能像正式作品那样 Cover / Remix。
+       Studio 导出产物（type='edit_crop'）才是完整的作品。
+
+     做法：
+       ① 用整首 clip 建一个单轨工程，clip 占满 [0, duration]
+       ② transposition 0（音频已经是原调，不需要补偿）
+       ③ warp 关闭（内容长度 == 场景长度）
+       ④ 提交 render-state，等 complete
+     ══════════════════════════════════════════════════════════════════ */
+  /* ★ v46.2：加了 restoreSemis 参数 —— 重传时加了 +N 移调，
+     Studio 里必须设 transposition = -N 才能把音高拉回原调。 */
+  async function exportWholeAsStudio(clipId, title, durationSec, log, restoreSemis) {
+    const L = log || (() => {});
+    const bps = BPS;
+
+    // 单 clip 工程：从 0 铺到结尾
+    const totalBeats = Math.max(4, durationSec * bps);
+    const trackId = uuid();
+    const clipUuid = uuid();
+
+    const state = {
+      timing: { type: 'manual', bps: bps, lockBPS: true, firstBeatSeconds: 0, bpsAutomation: [] },
+      markersRegistry: {},
+      recording: { countInBars: 0, preRollBars: 0 },
+      contextualWindowConfig: { focusedPanel: 'generate' },
+      sections: {},
+      tracks: [{
+        color: '#208BFF', takeLanes: [], faderAutomation: {},
+        clips: [{
+          color: '#FF6A00', fadeInCurve: 1, startBeats: 0, mute: false,
+          type: 'audio', fadeInBeats: 0,
+          transposition: -(Number(restoreSemis) || 0), formantCorrection: 0, streaming: false,
+          amplitude: 1, fadeOutBeats: 0, fadeOutCurve: 1,
+          loop: { endBeats: totalBeats, enabled: false, startBeats: 0 },
+          name: title,
+          endBeats: totalBeats, clipId: clipId, readStartBeats: 0,
+          id: clipUuid, asset: { type: 'clip', id: clipId }, reversed: false,
+          warp: { enabled: false },
+        }],
+        solo: false, mute: false, instrument: { type: 'song' }, type: 'audio',
+        eq: {}, clipCreationIntents: [], amplitude: 1, takeLanesExpanded: false,
+        balance: 0, signalChain: [], name: 'Main', id: trackId,
+        routingMode: 'linear', arm: false, height: 96,
+      }],
+      layout: {
+        midiAutomationLaneHeight: 24, arrangementEditorHeight: 280,
+        midiAutomationLaneId: { category: 'noteProperty', property: 'velocity' },
+      },
+      routing: {}, amplitude: 1, songFadeOutBeats: 0,
+      selection: {
+        contextAfterBeats: 32, focusBeats: totalBeats, noteIds: [],
+        contextBeforeBeats: 32, automationPointIndices: [],
+        trackIds: [trackId], focusedArea: 'timeline',
+        warpMarkerSeconds: {}, focusedTrackId: trackId, anchorBeats: 0,
+      },
+      loop: { endBeats: 32, enabled: false, startBeats: 0 },
+      masterRoutingMode: 'stereo', metronome: { enabled: false, volume: 0.5 },
+      editorPointerModes: {}, timeSignatureChanges: [], midiCcMappings: [],
+      songFadeInBeats: 0, masterSignalChain: [], lyricsCorrectionsByClipId: {},
+    };
+
+    // ① 建工程
+    const projectId = await createProject(title);
+    L('  Studio 工程: ' + projectId.slice(0, 8));
+
+    // ② 保存时间线
+    const saved = await gmFetch('POST', API + '/api/studio/save-project',
+      { project_id: projectId, state: state }, 40000);
+    if (saved.status !== 200) throw new Error('保存工程失败 HTTP ' + saved.status);
+
+    // ③ 提交导出
+    const exportId = await renderProject(projectId, title, state, totalBeats);
+    L('  导出已提交: ' + exportId.slice(0, 8));
+
+    // ④ 等导出完成
+    await waitRendered(exportId, L, 600000);
+    L('  ✓ 导出完成: ' + exportId.slice(0, 8));
+
+    return { projectId, exportId, url: 'https://suno.com/song/' + exportId };
+  }
+
   async function restorePieces(entries, original, log) {
     const rate = original.sampleRate;
     const channels = Math.min(2, original.numberOfChannels);
@@ -1208,18 +1642,54 @@
     return bufferToWav(output);
   }
 
+  /* ★ v46.1：改用 /api/feed/v3 轮询渲染结果
+
+     踩坑：v46 用 GET /api/clip/{id} 轮询，虽然拿到了 status=complete，
+     但作品库里查不到、plays=0 —— 说明那个接口读的是缓存态，
+     不是"作品真的落库"。
+
+     Suno Upload Desk 的做法（studio.cjs 实测）：
+       POST /api/feed/v3 { filters: { ids: { presence:'True', clipIds:[renderId] } }, limit: 1 }
+       → response.clips 里找 id===renderId 的那条，看 status
+
+     这才是"作品已在曲库"的权威判定。 */
   async function waitRendered(clipId, log, maxWaitMs) {
-    const t0 = Date.now(), limit = maxWaitMs || 300000;
+    const t0 = Date.now(), limit = maxWaitMs || 600000;
     let last = '';
     while (Date.now() - t0 < limit) {
-      await sleep(4000);
-      const r = await gmFetch('GET', API + '/api/clip/' + clipId, null, 30000);
-      if (r.status !== 200) continue;
-      let d;
-      try { d = JSON.parse(r.text); } catch (e) { continue }
-      if (d.status !== last) { last = d.status; log('    导出: ' + d.status); }
-      if (d.status === 'complete') return d;
-      if (d.status === 'error') throw new Error('导出失败');
+      await sleep(5000);
+      try {
+        const r = await gmFetch('POST', API + '/api/feed/v3', {
+          filters: { ids: { presence: 'True', clipIds: [clipId] } },
+          limit: 1,
+        }, 30000);
+        if (r.status === 200) {
+          let d;
+          try { d = JSON.parse(r.text); } catch (e) { d = null; }
+          const clip = d && d.clips && d.clips.find(c => c.id === clipId);
+          if (clip) {
+            const st = String(clip.status || '').toLowerCase();
+            if (st !== last) { last = st; log('    导出: ' + st); }
+            if (st === 'complete') return clip;
+            if (/error|failed|rejected|blocked|timeout/.test(st)) {
+              throw new Error('导出失败（' + st + '）');
+            }
+          }
+        }
+      } catch (e) {
+        if (/导出失败/.test(String(e && e.message))) throw e;
+        // 网络波动继续等
+      }
+      // 兜底：feed 查不到时用 clip 接口探一下状态
+      try {
+        const r2 = await gmFetch('GET', API + '/api/clip/' + clipId, null, 20000);
+        if (r2.status === 200) {
+          const d2 = JSON.parse(r2.text);
+          const st2 = String(d2.status || '').toLowerCase();
+          if (st2 !== last) { last = st2; log('    导出(clip): ' + st2); }
+          if (st2 === 'complete') return d2;
+        }
+      } catch (e) {}
     }
     throw new Error('导出超时');
   }
@@ -1666,7 +2136,7 @@
     if (UI) return UI;
 
     const pos = (() => { try { return JSON.parse(GM_getValue(K_POS, 'null')) } catch (e) { return null } })();
-    const minimized = GM_getValue(K_MIN, false) === true;
+    let minimized = GM_getValue(K_MIN, false) === true;   // ★ v50：改成可变，供快捷键切换
 
     /**
      * 把保存的位置夹回可视区域。
@@ -2030,6 +2500,22 @@ select.field{cursor:pointer}
 
     <!-- ═════ 上传 ═════ -->
     <div class="body" id="bodyMain">
+      <details class="envbox" id="envbox" style="margin:0 0 8px">
+        <summary style="cursor:pointer;font-size:12px;opacity:.85">
+          📋 使用前提（点开看）
+        </summary>
+        <div style="font-size:11.5px;line-height:1.7;opacity:.82;padding:6px 2px 2px">
+          <b>浏览器</b>：Chrome / Edge 110+ 或 Firefox 115+（需要 Web Audio + OfflineAudioContext）<br>
+          <b>脚本管理器</b>：Tampermonkey（推荐）或 Violentmonkey；需允许 <code>GM_xmlhttpRequest</code><br>
+          <b>Suno 账号</b>：已登录且能正常上传（免费版即可，上传会占用额度）<br>
+          <b>页面</b>：保持在 <code>suno.com/create</code>，上传期间不要刷新/关闭<br>
+          <b>内存</b>：至少 4GB 可用（整首 213 秒的歌约占 200-300MB）<br>
+          <b>网络</b>：能直连 studio-api-prod.suno.com 与 S3（国内需自备网络环境）<br>
+          <b>本地依赖</b>：无。不需要 FFmpeg / Python / Node<br>
+          <b>注意</b>：移调越小（越接近 0）段数越多、耗时越长
+        </div>
+      </details>
+
       <div class="guide" id="guide">
         <i data-g="1"><b>1</b>选文件</i>
         <i data-g="2"><b>2</b>参数</i>
@@ -2072,9 +2558,21 @@ select.field{cursor:pointer}
       <div class="row"><label>项目名</label><input id="t" class="field" placeholder="默认用文件名"></div>
 
       <div class="grid2">
-        <div class="row"><label>切片(秒)</label><input id="ss" class="field" value="" placeholder="自动" title="留空 = 自动按移调算（变速后仍 >= 6 秒）；填数字则强制使用该值"></div>
-        <div class="row"><label>变速</label><input id="pitch" class="field" value="24" title="24 = 时长压缩 4 倍（音高不变），最容易过指纹；0 = 不变速，最保真但可能被拒"></div>
+        <div class="row"><label>切片(秒)</label><input id="ss" class="field" value="" placeholder="6" title="上传片段的秒数。Suno 要求 >= 6 秒，一般不用改"></div>
+        <div class="row"><label>移调</label>
+          <input id="pitch" class="field" type="number" min="-24" max="24" step="1" value="24"
+                 title="整首移调半音数，-24 到 +24 任意整数。正值越大越易过指纹但丢高频；负值不丢高频但段数更多">
+        </div>
       </div>
+      <div class="row" style="display:flex;gap:6px;margin-top:-2px">
+        <button class="btn" data-pitch="24" style="flex:1">+24</button>
+        <button class="btn" data-pitch="12" style="flex:1">+12</button>
+        <button class="btn" data-pitch="7" style="flex:1">+7</button>
+        <button class="btn" data-pitch="0" style="flex:1">0</button>
+        <button class="btn" data-pitch="-7" style="flex:1">-7</button>
+        <button class="btn" data-pitch="-12" style="flex:1">-12</button>
+      </div>
+      <div class="row" id="pitchHint" style="font-size:11px;opacity:.72;margin-top:-4px"></div>
 
       <details class="adv">
         <summary>更多参数<span class="hint">默认已调好，不用改</span></summary>
@@ -2113,7 +2611,8 @@ select.field{cursor:pointer}
         <span><b id="n3">0</b>总段</span>
         <span><b id="n4">0</b>轮次</span>
       </div>
-      <div class="seg" id="sg"></div>
+      <!-- ★ v50：不再显示分块明细（#sg 已隐藏），只保留上方进度数字 -->
+      <div class="seg" id="sg" style="display:none"></div>
 
     </div>
 
@@ -2127,10 +2626,15 @@ select.field{cursor:pointer}
     <div class="body" id="bodyHist" style="display:none">
       <div class="libtitle"><span>📚 作品库</span></div>
       <div class="linkbar">
-        <input id="linkInput" class="field" placeholder="粘贴歌曲链接或 ID，回车直接下载">
+        <input id="linkInput" class="field" placeholder="粘贴歌曲链接或 ID，回车下载（Esc 清空）"
+               title="Enter 下载 · Esc 清空 · Ctrl+L 聚焦">
         <button class="go" id="linkGo">下载</button>
+        <button class="btn" id="linkClear" title="清空输入和下载记录">清除</button>
       </div>
-      <div class="hint">支持 <code>suno.com/song/xxx</code>、<code>suno.com/clip/xxx</code> 或直接粘贴 ID</div>
+      <div class="hint">
+        支持 <code>suno.com/song/xxx</code>、<code>suno.com/clip/xxx</code> 或直接粘贴 ID
+        · <kbd>Enter</kbd> 下载 · <kbd>Esc</kbd> 清空 · <kbd>Ctrl+L</kbd> 聚焦输入
+      </div>
       <div class="libbar">
         <input id="libq" class="field" placeholder="搜索我的作品...">
         <button class="btn" id="libRefresh">⟳ 刷新</button>
@@ -2408,6 +2912,7 @@ select.field{cursor:pointer}
       setEta('');
     }
     function paint() {
+      /* ★ v50：分块明细不再展示，paint 只更新数字与徽标 */
       // 只统计真正"完整"的段（部分覆盖的段不算成功）
       const ok = segs.filter(s => s.state === 'ok').length;
       $('#n1').textContent = ok;
@@ -2424,12 +2929,17 @@ select.field{cursor:pointer}
     }
 
     function setMin(m) {
-      GM_setValue(K_MIN, m);
-      panelEl.style.display = m ? 'none' : 'flex';
-      ballEl.style.display = m ? 'flex' : 'none';
+      minimized = !!m;                 // ★ v50：同步状态，快捷键才能来回切
+      GM_setValue(K_MIN, minimized);
+      panelEl.style.display = minimized ? 'none' : 'flex';
+      ballEl.style.display = minimized ? 'flex' : 'none';
     }
     $('#btnMin').onclick = () => setMin(true);
-    ballEl.onclick = () => setMin(false);
+    /* ★ v50：圆球拖动后不触发展开 */
+    ballEl.onclick = (e) => {
+      if (ballEl.dataset.dragged === '1') { e.preventDefault(); e.stopPropagation(); return; }
+      setMin(false);
+    };
     setMin(minimized);
 
     // 拖动
@@ -2481,19 +2991,51 @@ select.field{cursor:pointer}
       }
       window.addEventListener('resize', keepInView);
       setTimeout(keepInView, 300);
-      bar.addEventListener('mousedown', e => { onDown(e.clientX, e.clientY, e.target); e.preventDefault(); });
-      document.addEventListener('mousemove', e => onMove(e.clientX, e.clientY), true);
-      document.addEventListener('mouseup', onUp, true);
-      bar.addEventListener('touchstart', e => {
-        const t = e.touches[0];
-        onDown(t.clientX, t.clientY, e.target);
-        e.preventDefault();
-      }, { passive: false });
+      /* ★ v50：拖动句柄 = 面板标题栏 + 最小化圆球（两种状态都能拖）
+         圆球同时承担"点击展开"和"拖动"两种语义，
+         用一个 4px 位移阈值区分。 */
+      const ball = $('#ball');
+      let ballMoved = false;
+
+      function bindDrag(el, isBall) {
+        if (!el) return;
+        el.addEventListener('mousedown', e => {
+          if (!isBall && e.target && e.target.tagName === 'BUTTON') return;
+          ballMoved = false;
+          onDown(e.clientX, e.clientY, e.target);
+          e.preventDefault();
+        });
+        el.addEventListener('touchstart', e => {
+          if (!isBall && e.target && e.target.tagName === 'BUTTON') return;
+          ballMoved = false;
+          const t = e.touches[0];
+          onDown(t.clientX, t.clientY, e.target);
+          e.preventDefault();
+        }, { passive: false });
+      }
+
+      bindDrag(bar, false);
+      bindDrag(ball, true);
+
+      document.addEventListener('mousemove', e => {
+        if (dragging && (Math.abs(e.clientX - sx) > 4 || Math.abs(e.clientY - sy) > 4)) ballMoved = true;
+        onMove(e.clientX, e.clientY);
+      }, true);
       document.addEventListener('touchmove', e => {
         const t = e.touches[0];
+        if (dragging && (Math.abs(t.clientX - sx) > 4 || Math.abs(t.clientY - sy) > 4)) ballMoved = true;
         onMove(t.clientX, t.clientY);
       }, { passive: true });
-      document.addEventListener('touchend', onUp, true);
+
+      function endDrag() {
+        const wasDrag = ballMoved && dragging;
+        onUp();
+        // 圆球：拖动过就不触发展开（让 ballEl.onclick 自己判断）
+        ball.dataset.dragged = wasDrag ? '1' : '0';
+        setTimeout(() => { ball.dataset.dragged = '0'; }, 50);
+      }
+      document.addEventListener('mouseup', endDrag, true);
+      document.addEventListener('touchend', endDrag, true);
     })();
 
     let tab = 'main';
@@ -2838,8 +3380,50 @@ select.field{cursor:pointer}
     }
 
     $('#linkGo').onclick = downloadByLink;
+
+    /* ★ v50：一键清除
+       清空内容：输入框 + 作品库列表 + 本地缓存（不动 Suno 上的作品） */
+    function clearDownloadArea() {
+      if ($('#linkInput')) $('#linkInput').value = '';
+      if ($('#libq')) $('#libq').value = '';
+      try { libAll = []; } catch (e) {}
+      try { GM_setValue(K_LIB, ''); } catch (e) {}
+      const hist = $('#hist');
+      if (hist) hist.innerHTML = '<div class="empty">已清空。点「⟳ 刷新」重新加载</div>';
+      if ($('#libstat')) $('#libstat').textContent = '';
+      if ($('#linkInput')) $('#linkInput').focus();
+      log('已清空作品库列表与本地缓存');
+      status('已清空', 'ok');
+    }
+    if ($('#linkClear')) $('#linkClear').onclick = clearDownloadArea;
+
     $('#linkInput').addEventListener('keydown', e => {
-      if (e.key === 'Enter') downloadByLink();
+      if (e.key === 'Enter') { e.preventDefault(); downloadByLink(); }
+      else if (e.key === 'Escape') { e.preventDefault(); clearDownloadArea(); }
+    });
+
+    /* ★ v50：全局快捷键
+         Ctrl+L      聚焦下载输入框
+         Esc         关闭面板（回到圆球）
+         Ctrl+Shift+M 最小化 / 展开切换 */
+    document.addEventListener('keydown', e => {
+      if (e.ctrlKey && !e.shiftKey && (e.key === 'l' || e.key === 'L')) {
+        e.preventDefault();
+        switchTab('hist');
+        setTimeout(() => { if ($('#linkInput')) { $('#linkInput').focus(); $('#linkInput').select(); } }, 80);
+        return;
+      }
+      if (e.ctrlKey && e.shiftKey && (e.key === 'm' || e.key === 'M')) {
+        e.preventDefault();
+        setMin(!minimized);
+        return;
+      }
+      if (e.key === 'Escape') {
+        // 仅在焦点不在输入框时，Esc 收面板
+        const a = document.activeElement;
+        const inInput = a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT');
+        if (!inInput) { e.preventDefault(); setMin(true); }
+      }
     });
     // 粘贴即自动识别并提示
     $('#linkInput').addEventListener('paste', () => {
@@ -3286,6 +3870,45 @@ select.field{cursor:pointer}
       showResumeBar(p);
     })();
 
+    /* ★ v49：移调变化时更新代价提示 */
+    function updatePitchHint() {
+      const el = $('#pitchHint');
+      if (!el) return;
+      const v = parseFloat($('#pitch').value) || 0;
+      const r = Math.pow(2, v / 12);
+      const hf = Math.min(20, 24 / r);
+      const dur = audio ? audio.duration : 0;
+      const segs = dur ? Math.ceil(dur / 6) : 0;
+      const mem = dur ? dur * 48000 * 2 * 4 / 1048576 : 0;
+      let txt = '压缩 ' + r.toFixed(2) + ' 倍';
+      if (hf < 19.5) txt += ' · 高频保留到 ' + hf.toFixed(1) + 'kHz';
+      else txt += ' · 高频完整';
+      if (segs) txt += ' · 约 ' + segs + ' 段（内存 ' + mem.toFixed(0) + 'MB）';
+      if (mem > 200) txt += ' ⚠内存偏高';
+      el.textContent = txt;
+    }
+    if ($('#pitch')) {
+      $('#pitch').addEventListener('input', updatePitchHint);
+      $('#pitch').addEventListener('change', () => {
+        const v = Math.max(-24, Math.min(24, Math.round(Number($('#pitch').value) || 0)));
+        $('#pitch').value = v;
+        updatePitchHint();
+      });
+      setTimeout(updatePitchHint, 100);
+    }
+    /* ★ v50 修复：按钮在 Shadow DOM 里，
+       document.querySelectorAll 选不到，必须用 sh（shadowRoot）。 */
+    sh.querySelectorAll('[data-pitch]').forEach(b => {
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const inp = $('#pitch');
+        if (!inp) return;
+        inp.value = b.dataset.pitch;
+        updatePitchHint();
+      });
+    });
+
     (function restoreCfg() {
       const c = loadCfg();
       // 只恢复不影响成功率的项
@@ -3295,7 +3918,7 @@ select.field{cursor:pointer}
       // v17：这三项用实测最优值，不读旧配置
       $('#ss').value = 6;      // 6 秒切片最容易过指纹
       // ★ 移调不能太大：+4 保留 19kHz 带宽，+24 会把 6kHz 以上全砍掉（音质灾难）
-      $('#pitch').value = 24;
+      $('#pitch').value = String(PITCH);
       // 并发太高容易触发 S3 限流导致请求悬挂，默认 4
       $('#cf').value = 4;
       $('#doExport').checked = true;
@@ -3318,26 +3941,56 @@ select.field{cursor:pointer}
 
     async function prepare(replan = false) {
       if (!audio) {
+        /* ★ v49：先把 UI 里的移调值应用到 PITCH */
+        if ($('#pitch')) {
+          const applied = setPitch($('#pitch').value);
+          if (applied !== Number($('#pitch').value)) {
+            log('移调 ' + $('#pitch').value + ' 超出范围，已夹到 ' + applied);
+            $('#pitch').value = applied;
+          }
+        }
         status('解码中...', 'run');
         log('解码音频...');
-        audio = await decodeAudio(file);
-        log('时长 ' + audio.duration.toFixed(1) + 's, ' + audio.sampleRate + 'Hz, ' +
-            audio.numberOfChannels + 'ch');
+        const rawAudio = await decodeAudio(file);
+        log('原始 ' + rawAudio.duration.toFixed(1) + 's, ' + rawAudio.sampleRate + 'Hz, ' +
+            rawAudio.numberOfChannels + 'ch');
+
+        /* ★ v45：整首 +24 半音移调（音高↑、时长÷4）
+           目的：段数少 4 倍（280s 歌从 47 段降到 12 段），过审率高得多。
+           还原放在本地拼装阶段（assembleWhole 里 −PITCH 拉回）。
+           不在 Studio 里还原 —— 实测 warp 不做真正拉长。 */
+        /* ★ v49：负移调会让音频变长，内存随之上升。
+           float32 立体声 48k = 384 KB/s。
+           估算压缩后的内存占用，超过安全线就拒绝并回退到 +12。 */
+        {
+          const r0 = Math.pow(2, PITCH / 12);
+          const estSec = rawAudio.duration / r0;
+          const estMB = estSec * 48000 * 2 * 4 / 1048576;
+          if (estMB > 260) {
+            const safe = 12;
+            log('⚠ 移调 ' + PITCH + ' 会让音频变成 ' + estSec.toFixed(0) +
+                's（约 ' + estMB.toFixed(0) + 'MB），超出安全范围');
+            log('  自动改用 +' + safe + ' 半音（约 ' +
+                (rawAudio.duration / Math.pow(2, safe / 12) * 48000 * 2 * 4 / 1048576).toFixed(0) + 'MB）');
+            setPitch(safe);
+            if ($('#pitch')) $('#pitch').value = String(safe);
+          }
+        }
+        status('整首移调中...', 'run');
+        const ratio = Math.pow(2, PITCH / 12);
+        const t0 = performance.now();
+        const shifted = await pitchShiftResample(bufferToWav(rawAudio), PITCH);
+        audio = await decodeToBuffer(shifted.blob);
+        log('✓ 整首移调 ' + (PITCH >= 0 ? '+' : '') + PITCH + ' 半音：' +
+            rawAudio.duration.toFixed(1) + 's → ' + audio.duration.toFixed(1) + 's（×' +
+            (1 / ratio).toFixed(3) + '，' + Math.round(performance.now() - t0) + 'ms）');
       }
-      let want = parseFloat($('#ss').value) || 0;   // 0 = 自动
-      if (!(want > 0)) want = MIN_SEG;
-      /* ★ v38.1：变速不变调时，切片长度必须让【变速后】仍 >= 6 秒。
-         factor = 2^(semis/12)，例 semis=24 → factor=4 → 切片至少 6x4=24s。
-         以前沿用默认 6 秒，变速后只剩 1.5 秒，Suno 直接拒收
-         （实测日志：Uploaded audio is too short (currently 1.6 seconds)）。 */
-      const semisNow = parseFloat($('#pitch').value) || 0;
-      const factorNow = Math.max(1, Math.pow(2, semisNow / 12));
-      const needSec = Math.ceil(SUNO_MIN_UPLOAD * factorNow) + 2;
-      if (want < needSec) {
-        log('切片从 ' + want + 's 调整为 ' + needSec + 's');
-        log('  原因：变速 x' + factorNow.toFixed(2) + ' 会把时长压缩到 1/' + factorNow.toFixed(2) + '，Suno 要求 >= ' + SUNO_MIN_UPLOAD + ' 秒');
-        want = needSec;
-      }
+      /* ★ v49：切片固定 6 秒（压缩后的秒数）
+         Suno 要求上传音频 >= 6 秒。
+         +24 时 6 秒压缩 = 原始 24 秒；0 时 = 原始 6 秒；-12 时 = 原始 3 秒 */
+      let want = parseFloat($('#ss').value) || 0;
+      if (!(want > 0)) want = SUNO_MIN_UPLOAD;
+      if (want < SUNO_MIN_UPLOAD) want = SUNO_MIN_UPLOAD;
 
       const sec = want;
       // ★ 用 floor 而不是 ceil：ceil 会把步长压到 sec 以下
@@ -3348,12 +4001,12 @@ select.field{cursor:pointer}
       let step = audio.duration / n;
 
       // 保险：步长经变速后仍不足 6 秒，就再减少段数
-      while (n > 1 && step / factorNow < SUNO_MIN_UPLOAD) {
+      while (n > 1 && step < SUNO_MIN_UPLOAD) {
         n--;
         step = audio.duration / n;
       }
-      if (step / factorNow < SUNO_MIN_UPLOAD) {
-        log('⚠ 音频太短：整首上传后只有 ' + (step / factorNow).toFixed(1) +
+      if (step < SUNO_MIN_UPLOAD) {
+        log('⚠ 音频太短：整首上传后只有 ' + (step).toFixed(1) +
             's，Suno 会自动补静音（可能引起轻微错位）');
       }
       if (step > sec * 1.05) {
@@ -3370,7 +4023,7 @@ select.field{cursor:pointer}
           });
         }
         log('分段: ' + n + ' 段 × ' + step.toFixed(1) + 's' +
-            '（上传后约 ' + (step / factorNow).toFixed(1) + 's）');
+            '（上传后约 ' + (step).toFixed(1) + 's）');
         showFileCard(file, audio.duration.toFixed(1) + 's · ' + n + ' 段 × ' +
           step.toFixed(1) + 's');
       }
@@ -3402,17 +4055,25 @@ select.field{cursor:pointer}
             return [];
           }
         }
-        /* ★ v38：上传前用【变速不变调】而不是移调。
-           semis 现在表示"要提速多少"：factor = 2^(semis/12)。
-           音高保持不变 → Studio 用致密 warp 拉回长度，成品音高天然等于原曲。 */
-        const factor = Math.pow(2, (pitchSemis + i) / 12);
-        const semis = pitchSemis + i;   // 仅用于命名/日志
+        /* ★ v47.2：上传前【不再做任何变速】
+
+           踩坑记录（213 秒歌 / 8 段，实测）：
+             v45 起整首已经 +24 移调（时长 ÷4），
+             但这里 v38 遗留的 speedUpKeepPitch(base, factor=4) 又变速一次，
+             实际变成 ÷16。而上传时长只有 1.67s < 6s，
+             Suno 在【开头】补 4.93s 静音凑到 6.6s。
+             拼装时按 ÷4 反向移调，静音被放大 4 倍 →
+             每段 19.5s 静音空档，成品 73.5% 是静音。
+
+           正确做法：整首移调已经完成了时长压缩，
+             单段只需原样切片上传（sliceToWav 会补到 6 秒）。
+             拼装时按 (1/整首移调倍数) 反向还原即可。 */
+        const factor = 1;                      // 不再二次变速
+        const semis = pitchSemis;              // 只记录整首移调量
         try {
           const base = sliceToWav(audio, t0, t1);
-          const shifted = factor <= 1.001
-            ? { blob: base, seconds: t1 - t0 }
-            : await speedUpKeepPitch(base, factor, (m) => log(pad + m));
-          const name = 'p' + label.replace(/\W/g, '') + '_x' + factor.toFixed(2) + '.wav';
+          const shifted = { blob: base, seconds: t1 - t0 };
+          const name = 'p' + label.replace(/\W/g, '') + '_raw.wav';
 
           const up = await uploadSegment(shifted.blob, name,
             label + (semis ? ' +' + semis : ''), 'wav', 180000,
@@ -3502,6 +4163,22 @@ select.field{cursor:pointer}
             (pitchSemis ? ' | 移调 +' + pitchSemis + ' 半音起' : '') +
             (wantExport ? ' | 导出' : ''));
 
+        /* ★ v49：按移调值给出实际代价提示 */
+        {
+          const r0 = Math.pow(2, pitchSemis / 12);
+          const compSec = audio.duration;            // 已移调后的时长
+          const segs0 = Math.ceil(compSec / 6);
+          const memMB = compSec * 48000 * 2 * 4 / 1048576;
+          log('移调 ' + (pitchSemis >= 0 ? '+' : '') + pitchSemis + ' → 压缩 ' +
+              r0.toFixed(2) + ' 倍，时长 ' + compSec.toFixed(1) + 's，约 ' +
+              segs0 + ' 段，内存约 ' + memMB.toFixed(0) + 'MB');
+          if (memMB > 200) {
+            log('⚠ 内存占用偏高（' + memMB.toFixed(0) + 'MB），长音频可能卡顿或崩溃');
+          }
+          if (segs0 > 60) {
+            log('⚠ 段数偏多（' + segs0 + ' 段），上传耗时会长很多');
+          }
+        }
         // 移调过大会永久损失高频（Nyquist 截断），提示用户
         if (pitchSemis > 7) {
           const limitK = (24 / Math.pow(2, pitchSemis / 12)).toFixed(1);
@@ -3703,23 +4380,22 @@ select.field{cursor:pointer}
             log('BPM 检测失败，沿用 bps ' + BPS);
           }
         } catch (e) { log('BPM 检测异常: ' + e.message + '，沿用 bps ' + BPS); }
-        const built = buildState(pieces, title);
+        /* ★ v47：不再用「分段」建 Studio 工程
+
+           实测根因（213 秒歌 / 8 段）：
+             用 8 段建工程时，每段场景占位 = 6.67s(压缩) × 4 = 26.68s，
+             但每段音频内容只有 6.67s（transposition 不拉长内容），
+             → 每段留 20s 静音，成品每 26.68s 一个大空洞。
+
+           正确做法：只把 assembleWhole 拼好的【整首】放进 Studio。
+             整首 clip 内容 == 场景占位（1:1），零静音。
+
+           pid 保持 null —— exportWholeAsStudio 会自己建工程。
+        */
+
+        /* v47：semisSet 曾被我误删，导致上传成功后崩在 segCount 记录 */
         const semisSet = Array.from(new Set(pieces.map(p => Number(p.semis) || 0)))
           .filter(x => x !== 0).sort((a, b) => a - b);
-        try {
-          status('建 Studio 项目...', 'run');
-          const projectId = window.__PID || await createProject(title);
-          const saved = await gmFetch('POST', API + '/api/studio/save-project',
-            { project_id: projectId, state: built.state });
-          if (saved.status !== 200) throw new Error('保存 Studio 项目 HTTP ' + saved.status);
-          pid = window.__PID = projectId;
-          saveProgress('project');
-          log('项目已保存: ' + pid.slice(0, 8));
-        } catch (e) {
-          if (!wantExport) throw e;
-          projectError = e.message;
-          log('✗ Studio: ' + projectError);
-        }
 
         let finalId = null;
         let localWav = null;
@@ -3734,25 +4410,223 @@ select.field{cursor:pointer}
           // 纯原速且没有补齐时，可直接使用 Studio 导出。
           // ★ v36 = 上游做法：能出 Studio 就用 Studio 成品（不再本地重建）
           // ★ v38.6.0 = 上游做法：只要有工程就走 Studio 合并导出（不再本地重建）
+          /* ★ v45 本地拼装（C 方案）
+             不依赖 Studio 渲染 —— 实测证明 warp 不做真正拉长。
+             流程：逐段下载 → 反向移调 −PITCH → 按序拼成整条 → 重传。
+             这就是 sunouploader 在服务端做的事，我们搬到浏览器本地。 */
           if (pid) {
+            log('Studio 工程已存档: suno.com/studio/' + pid);
+          }
+          {
+            status('逐段还原 + 本地拼装整首...', 'run');
+            const tAssemble = performance.now();
+            const asm = await assembleWhole(pieces, log, {
+              sampleRate: audio.sampleRate || 48000,
+              channels: Math.min(2, audio.numberOfChannels || 2),
+              totalSeconds: audio.duration,
+            });
+            log('✓ 本地拼装耗时 ' + Math.round(performance.now() - tAssemble) + 'ms，' +
+                asm.seconds.toFixed(2) + 's');
+
+            // 时长自检
+            const expect = audio.duration * Math.pow(2, PITCH / 12);
+            const drift = Math.abs(asm.seconds - expect);
+            if (drift > 0.5) {
+              log('⚠ 拼装时长 ' + asm.seconds.toFixed(2) + 's 与预期 ' +
+                  expect.toFixed(2) + 's 差 ' + drift.toFixed(2) + 's');
+            }
+
+            type = '本地拼装';
+            let finalSemis = 0;   // 成品实际用的移调量（供用户参考）
+
+            // 整条重传 = 最终成品
+            status('上传整首成品...', 'run');
             try {
-              status('Studio 合并导出...', 'run');
-              const lastBeats = built.state.tracks[0].clips.at(-1).endBeats;
-              const exportId = await renderProject(pid, title, built.state, lastBeats);
-              window.__EXPORT = exportId;
-              saveProgress('export');
-              await waitRendered(exportId, log, 300000);
-              const rendered = await decodeToBuffer(await fetchClipAudio(exportId));
-              // ★ v37.3：不要再把"时长略有偏差"当硬失败——Studio 渲染+AAC 编解码本来就有几十毫秒填充，
-              //   以前这里一抛错就回退到本地重建，重建出来的音频又必然撞指纹。改成只记日志。
-              try { checkRestoredAudio(rendered, audio); } catch (e) { log('⚠ 时长校验: ' + e.message + '（继续用 Studio 成品）'); }
-              finalId = exportId;
-              type = 'Studio 成品';
-              log('✓ Studio 成品: ' + finalId.slice(0, 8) + '（时长 ' + rendered.duration.toFixed(1) + 's）');
+              /* ★ v48 关键：上传【+24 移调后的整首】(audio，53.36s)
+                 而不是未移调的拼装结果（213.44s）。
+
+                 依据 sunouploader 实测数据：
+                   12 段 × 6s = 72s（+24 移调内容）
+                   Studio transposition +24 → 288s ≈ 原曲 280.4s
+                 说明 Studio 的 transposition【会拉伸时长】。
+
+                 而 +24 的文件必然过指纹（我们所有分段都过了）。 */
+              /* ★ v48.1：裁掉音频末尾的静音
+                 实测：Studio 拉回 4 倍后，末尾 3.38s 静音会变成 13.5s。
+                 来源：Suno 存储时补白 + 拼装时补齐。
+                 做法：从末尾往前找最后一个非静音样本，切掉之后的。 */
+              /* ★ v49.1：拼装结果 → 裁尾 → +MASTER_PITCH 掩护 → 上传
+                 注意：这里用的是【拼装后的整首】(asm.audio)，不是 audio，
+                 因为 asm 已经还原到原调、原长。 */
+              const trimmed = trimTailSilence(asm.audio || audio, log);
+              const masterSrc = bufferToWav(trimmed);
+              status('成品加上传掩护...', 'run');
+              const masterShift = await pitchShiftResample(masterSrc, MASTER_PITCH);
+              log('成品上传掩护：+' + MASTER_PITCH + ' 半音（' +
+                  trimmed.duration.toFixed(1) + 's → ' + masterShift.seconds.toFixed(1) + 's）');
+              let extension = 'mp3';
+              const blob = (await prepareMasterUpload(masterShift.blob)).blob;
+              log('成品格式：' + extension.toUpperCase() + '（' +
+                  (blob.size / 1048576).toFixed(1) + ' MiB）');
+
+              /* ★ v45.5：整首重传的退避阶梯
+
+                 实测：拼好的整首重传必被 ACRCloud / Audible Magic 认出
+                 （它就是原曲，只是段间接缝有微小差异）。
+
+                 策略（逐级加强）：
+                   第 1 档  +0.5 半音   —— 只破坏音高对齐
+                   第 2 档  +1.2 半音
+                   第 3 档  +2.5 半音
+                   第 4 档  +4.0 半音 + 轻度 EQ（削 2.8-7.8kHz）
+                   第 5 档  +7.0 半音 + EQ
+                   第 6 档  +12  半音 + EQ   —— 一个八度，指纹必然失效
+                   之后每次 +1 半音，最多 12 次
+
+                 音高偏移靠 Studio 的 transposition 反向补：
+                 上传 +N，Studio 给 -N，成品音高正确。
+                 （这里只上传，不做 Studio 合并 —— 成品直接带偏移，
+                   用户可在 Suno 里手动 Cover 或我们下轮再做还原。） */
+              /* ★ v47.3：移调阶梯加大
+
+                 实测（213 秒歌）：
+                   +0.5 / +1.2 / +2.5 全部被拒
+                   （upload_failure_match_acrcloud / match_audible_magic）
+                   而 60 秒歌 +0.5 就过了 —— 长音频更容易命中指纹。
+
+                 所以阶梯改成更激进：起步 1.0，快速爬到 7，最高 12。
+                 实测过的分界点：+4 是 60 秒歌的通过点，
+                 长音频需要更高。 */
+              /* ★ v48.2：整首重传【不再加指纹退避移调】
+
+                 原因（实测 213 秒歌）：
+                   +24 移调后的整首（53.36s）本身就能过指纹
+                     —— 我们所有分段都过了，整首同理。
+                   之前加 +1 半音后时长变成 50.4s，
+                   但 Studio 仍按 -25 拉 4.24 倍 → 213.7s，
+                   超出实际内容 → 末尾 13.4s 静音。
+
+                 所以：整首重传用 0 移调，Studio transposition 精确 = -PITCH。 */
+              /* ★ v50：成品上传的退避阶梯（全部【不改时长】的手段）
+                 踩过的坑：v48.2 把这里写成 [0] 且 semis 恒 0，
+                 12 次循环上传的是同一个文件，一次被拒就 12 次全败。
+
+                 修法：用不改时长的扰动逐级加强，保证
+                 Studio transposition 恒为 -MASTER_PITCH。
+                   1 级：原样
+                   2 级：削人声频段（轻）
+                   3 级：削人声频段（重）
+                   4 级：+ 粉红噪声底
+                   5 级：+ 微合唱
+                   6 级起：全开
+                 */
+              let up = null;
+              let attempt = 0;
+              let lastErr = '';
+              const MAX_TRY = 8;
+              while (attempt < MAX_TRY) {
+                attempt++;
+                let work = blob;
+
+                // 逐级加强（都不改时长）
+                if (attempt >= 2) {
+                  const heavy = attempt >= 3;
+                  try {
+                    work = await cutVocalBand(work, log, heavy);
+                  } catch (e) { /* 忽略 */ }
+                }
+                if (attempt >= 4) {
+                  try { work = await addNoiseFloor(work, -66); } catch (e) {}
+                }
+                if (attempt >= 5) {
+                  try { work = await microChorus(work, log); } catch (e) {}
+                }
+
+                if (attempt === 1) {
+                  status('成品上传...', 'run');
+                  log('⚑ 第 1 次：原样上传（已带 +' + MASTER_PITCH + ' 掩护）');
+                } else {
+                  status('成品重传 · 第 ' + attempt + ' 级', 'run');
+                  log('⚑ 第 ' + attempt + ' 次：加强扰动（削频段' +
+                      (attempt >= 3 ? '+重' : '') +
+                      (attempt >= 4 ? '+噪声' : '') +
+                      (attempt >= 5 ? '+合唱' : '') + '）');
+                }
+
+                const prepared = await prepareMasterUpload(work);
+                const send = prepared.blob;
+                extension = prepared.extension;
+
+                try {
+                  up = await uploadSegment(send, 'assembled.' + extension, title,
+                    extension, 900000, (step) => {
+                      status('成品上传 · ' + step, 'run');
+                      log('  成品上传：' + step);
+                    });
+                  log('✓ 成品通过审查（第 ' + attempt + ' 次尝试）');
+                  break;
+                } catch (err) {
+                  lastErr = String(err && err.message || '');
+                  if (/match_version_id|match_acrcloud|match_audible_magic|existing recording/i.test(lastErr)) {
+                    log('  × 仍被识别为原曲（' + lastErr.slice(0, 60) + '）');
+                    continue;
+                  }
+                  if (/lyrics_copyright/i.test(lastErr)) {
+                    log('  × 歌词版权（' + lastErr.slice(0, 60) + '）');
+                    continue;
+                  }
+                  if (/Failed to fetch|NetworkError|timeout|50[0234]|S3/i.test(lastErr)) {
+                    log('  ⚑ 网络错误，3 秒后重试: ' + lastErr.slice(0, 60));
+                    await new Promise(r => setTimeout(r, 3000));
+                    attempt--;   // 网络错误不消耗重试次数
+                    if (attempt < -3) throw err;
+                    continue;
+                  }
+                  throw err;
+                }
+              }
+              if (!up) throw new Error('12 次重试仍被拒（最后错误：' + lastErr.slice(0, 80) + '）');
+
+              const uploadedClipId = up.clipId;
+              log('✓ 整首已上传: ' + uploadedClipId.slice(0, 8));
+
+              /* ★ v46 关键一步：把整首做成 Studio 工程并导出。
+                 这一步才是"成品出现在 Suno 作品库、可以 Cover"的正路。
+                 sunouploader 教程：「调用 Suno 创建 Studio 工程并提交导出」。
+
+                 注意：如果重传时加了移调，Studio 里要反向补回来：
+                   上传 +N → Studio transposition = -N
+                 这样成品音高回到原调。 */
+              status('创建 Studio 工程并导出...', 'run');
+              try {
+                const dur = asm.seconds;
+                const tExp = performance.now();
+                /* 上传文件的移调量 = PITCH（整首）+ finalSemis（指纹退避）
+                   Studio 要反向补回：transposition = -(PITCH + finalSemis) */
+                const res = await exportWholeAsStudio(
+                  uploadedClipId, title, dur, log, MASTER_PITCH);
+                log('✓ Studio 导出完成（' +
+                    Math.round((performance.now() - tExp) / 1000) + 's）');
+                log('  Studio transposition -' + MASTER_PITCH + ' 半音：把 ' +
+                    masterShift.seconds.toFixed(1) + 's 拉回 ' + dur.toFixed(1) + 's');
+                log('  作品链接: ' + res.url);
+
+                finalId = res.exportId;
+                type = 'Studio 成品';
+                window.__FINAL_URL = res.url;
+                log('✓ 成品已进入 Suno 作品库: ' + res.url);
+              } catch (e) {
+                // Studio 导出失败不影响已上传的整首 clip
+                log('⚠ Studio 导出失败: ' + e.message);
+                log('  整首 clip 已在库里: https://suno.com/song/' + uploadedClipId);
+                finalId = uploadedClipId;
+                type = '整首 clip（未走 Studio 导出）';
+              }
             } catch (e) {
-              problem = 'Studio导出: ' + e.message;
-              status('Studio 导出失败：' + e.message, 'err');
-              log('✗ Studio 导出: ' + e.message);
+              problem = '成品上传：' + e.message;
+              log('✗ ' + problem);
+              // 失败也保留本地 WAV，用户可手动下载
+              localWav = asm.blob;
             }
           }
           if (!finalId) {
