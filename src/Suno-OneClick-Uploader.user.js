@@ -2,7 +2,7 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      51.1.0
+// @version      51.2.0
 // @description  把任意音频切片上传到 Suno，自动移调绕过指纹、本地拼装、Studio 导出成正式作品。成品进入 Suno 作品库可直接 Cover。附带「听歌赚积分」。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
@@ -56,7 +56,7 @@
     return PITCH;
   }
   const POLL_MS = 4000;
-  const VERSION = 'v51.1.0';
+  const VERSION = 'v51.2.0';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -4110,7 +4110,15 @@ select.field{cursor:pointer}
      */
     async function uploadWithBisect(t0, t1, depth, label, pitchSemis, maxTry) {
       const dur = t1 - t0;
-      const MAX_DEPTH = 3;
+      /* ★ v51.2：最大二分深度 4 层（对齐 sunouploader）
+         6 秒切片的最深拆分：
+           d0 6.000s 内容
+           d1 3.000s（+3.0 静音）
+           d2 1.500s（+4.5 静音）
+           d3 0.750s（+5.25 静音）
+           d4 0.375s（+5.625 静音，有效占比仅 6.2%）
+         再深就没意义了。 */
+      const MAX_DEPTH = 4;
       const pad = '  '.repeat(depth);
 
       for (let i = 0; i < maxTry; i++) {
@@ -4210,8 +4218,13 @@ select.field{cursor:pointer}
 
          所以判断标准应该是「内容是否还值得拆」，
          而不是「拆完是否还能达到 6 秒」。
-         用 MIN_CONTENT = 0.8 秒（再短就没意义了，且补静音的占比过高）。 */
-      const MIN_CONTENT = 0.8;
+         用 MIN_CONTENT 判「内容是否还值得拆」。
+
+         ★ v51.2：从 0.8 降到 0.3
+           0.8 会卡在第 2 层（1.5/2=0.75 < 0.8），4 层永远到不了。
+           要允许拆到 d4（0.375s），MIN_CONTENT 必须 <= 0.375。
+           取 0.3 留余量。 */
+      const MIN_CONTENT = 0.3;
       if (depth >= MAX_DEPTH || dur / 2 < MIN_CONTENT) {
         log(pad + '✗ 放弃（已切 ' + depth + ' 层，' + dur.toFixed(1) + 's）');
         return [{
