@@ -2,7 +2,7 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      50.0.0
+// @version      50.1.0
 // @description  把任意音频切片上传到 Suno，自动移调绕过指纹、本地拼装、Studio 导出成正式作品。成品进入 Suno 作品库可直接 Cover。附带「听歌赚积分」。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
@@ -56,7 +56,7 @@
     return PITCH;
   }
   const POLL_MS = 4000;
-  const VERSION = 'v50.0.0';
+  const VERSION = 'v50.1.0';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -761,9 +761,34 @@
   }
 
   // LAME 可单独替换，源代码及 LGPL 许可：https://github.com/shijinyu/lamejs
+  /* ★ v50.1：成品上传的格式选择
+     踩坑：205 秒的歌拼成 WAV 是 33MB，超过 8MB 阈值就走 MP3 编码器，
+          编码器不可用（CSP 拦 Worker）时直接抛「MP3 编码器未加载」，
+          整个流程中断 —— 明明直接用 WAV 也能传。
+
+     修法：
+       ① 阈值放宽到 24MB（Suno 接受大文件）
+       ② 超过阈值且编码器不可用时，降采样到 44.1k 再试
+       ③ 仍不行就传 WAV（宁大勿断）
+     */
   async function prepareMasterUpload(wav) {
-    if (wav.size <= 8 * 1024 * 1024) return { blob: wav, extension: 'wav' };
-    if (typeof lamejs === 'undefined' || !lamejs.Mp3Encoder) throw new Error('MP3 编码器未加载');
+    const HARD_LIMIT = 24 * 1024 * 1024;   // 24MB 以内直接 WAV
+    if (wav.size <= HARD_LIMIT) return { blob: wav, extension: 'wav' };
+
+    const hasLame = (typeof lamejs !== 'undefined' && lamejs.Mp3Encoder);
+    if (!hasLame) {
+      // 编码器不可用 → 降采样到 44.1k 单次重试，尽量压到阈值内
+      try {
+        const slim = await toWav(wav, 44100);
+        if (slim.size <= HARD_LIMIT) {
+          return { blob: slim, extension: 'wav' };
+        }
+        // 还是超 → 传 44.1k WAV（Suno 能接受，只是上传慢点）
+        return { blob: slim, extension: 'wav' };
+      } catch (e) {
+        return { blob: wav, extension: 'wav' };
+      }
+    }
 
     let pcm = new DataView(await wav.arrayBuffer());
     let header = lamejs.WavHeader.readHeader(pcm);
@@ -2682,6 +2707,10 @@ select.field{cursor:pointer}
 
     const lines = [];
     let file = null, audio = null, segs = [], running = false;
+    /* ★ v50.1：audio 是按哪个移调值生成的 + 原始解码结果
+       用于「改了移调再跑」时重新移调（以前会沿用旧音频导致倍率错乱） */
+    let _audioPitch = null;
+    let _rawAudio = null;
 
     // ==================== 阶段 ====================
     const STAGES = { 1: '准备', 2: '切片', 3: '上传', 4: '建项目', 5: '导出', 6: '完成' };
@@ -3760,6 +3789,7 @@ select.field{cursor:pointer}
       }
 
       file = f; audio = null; segs = [];
+      _audioPitch = null; _rawAudio = null;   // ★ v50.1：换文件必须清缓存
       window.__PIECES = []; window.__PID = null; window.__EXPORT = null;
       backToMain();
       $('#t').value = f.name.replace(/\.[^.]+$/, '');
@@ -3788,6 +3818,7 @@ select.field{cursor:pointer}
     function restoreProgress(p, f) {
       file = f;
       audio = null;
+      _audioPitch = null; _rawAudio = null;   // ★ v50.1
       backToMain();
       setGuide(2);
       hint('已恢复进度，点 <b>开始上传</b> 继续');
@@ -3940,18 +3971,38 @@ select.field{cursor:pointer}
     });
 
     async function prepare(replan = false) {
-      if (!audio) {
-        /* ★ v49：先把 UI 里的移调值应用到 PITCH */
-        if ($('#pitch')) {
-          const applied = setPitch($('#pitch').value);
-          if (applied !== Number($('#pitch').value)) {
-            log('移调 ' + $('#pitch').value + ' 超出范围，已夹到 ' + applied);
-            $('#pitch').value = applied;
-          }
+      /* ★ v50.1：先把 UI 的移调值应用到 PITCH（每次都做，不只在首次） */
+      if ($('#pitch')) {
+        const applied = setPitch($('#pitch').value);
+        if (applied !== Number($('#pitch').value)) {
+          log('移调 ' + $('#pitch').value + ' 超出范围，已夹到 ' + applied);
+          $('#pitch').value = applied;
         }
+      }
+
+      /* ★ v50.1 关键修复：移调值变了必须【重新移调】。
+         以前整段包在 if (!audio) 里，改完移调点「再次上传」会沿用
+         旧音频（比如 +24 压缩的 51s），但拼装按新倍率（+7）还原，
+         结果成品倍率完全错乱（实测拿到 51s 的"还原"文件）。 */
+      const needRedo = audio && _audioPitch !== null && _audioPitch !== PITCH;
+      if (needRedo) {
+        log('检测到移调从 ' + _audioPitch + ' 改为 ' + PITCH + '，重新移调...');
+        audio = null;
+        segs = [];
+        window.__PIECES = [];
+      }
+
+      if (!audio) {
         status('解码中...', 'run');
-        log('解码音频...');
-        const rawAudio = await decodeAudio(file);
+        /* 用缓存的原始解码结果，避免重复解码 */
+        let rawAudio = _rawAudio;
+        if (!rawAudio) {
+          log('解码音频...');
+          rawAudio = await decodeAudio(file);
+          _rawAudio = rawAudio;
+        } else {
+          log('复用已解码的原始音频（跳过解码）');
+        }
         log('原始 ' + rawAudio.duration.toFixed(1) + 's, ' + rawAudio.sampleRate + 'Hz, ' +
             rawAudio.numberOfChannels + 'ch');
 
@@ -3981,6 +4032,7 @@ select.field{cursor:pointer}
         const t0 = performance.now();
         const shifted = await pitchShiftResample(bufferToWav(rawAudio), PITCH);
         audio = await decodeToBuffer(shifted.blob);
+        _audioPitch = PITCH;   // ★ v50.1：记住这份 audio 是按哪个移调生成的
         log('✓ 整首移调 ' + (PITCH >= 0 ? '+' : '') + PITCH + ' 半音：' +
             rawAudio.duration.toFixed(1) + 's → ' + audio.duration.toFixed(1) + 's（×' +
             (1 / ratio).toFixed(3) + '，' + Math.round(performance.now() - t0) + 'ms）');
