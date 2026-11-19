@@ -2,7 +2,7 @@
 // @name         Suno 一键上传器
 // @name:en      Suno One-Click Uploader
 // @namespace    local.suno.uploader
-// @version      50.1.0
+// @version      51.1.0
 // @description  把任意音频切片上传到 Suno，自动移调绕过指纹、本地拼装、Studio 导出成正式作品。成品进入 Suno 作品库可直接 Cover。附带「听歌赚积分」。
 // @description:en  Slice and upload any audio to Suno, bypass fingerprint check, merge into a full song, export and download. Includes auto credit farming on listen-and-rank.
 // @author       local
@@ -56,7 +56,7 @@
     return PITCH;
   }
   const POLL_MS = 4000;
-  const VERSION = 'v50.1.0';
+  const VERSION = 'v51.1.0';
   const K_POS = 'suno_up:pos';
   const K_MIN = 'suno_up:min';
   const K_HIST = 'suno_up:hist';
@@ -1378,8 +1378,23 @@
     const totalSec = o.totalSeconds || 0;
     const L = log || (() => {});
 
-    const sorted = pieces.slice().sort((a, b) => a.t0 - b.t0);
-    if (!sorted.length) throw new Error('没有可拼装的片段');
+    /* ★ v51：过滤掉 status='split' 的占位切片
+       照 sunouploader 的做法：父段只占位、从不上传，拼装时不参与。
+       实测（0 移调 205 秒）：115 片里 40 个 split、75 个 done。
+       过滤后按 t0 排序，位置天然对齐 —— 子段保留了原始时间轴坐标。 */
+    const all = pieces.slice();
+    const usable = all.filter(p => p.status !== 'split' && p.clipId);
+    const placeholders = all.filter(p => p.status === 'split' || !p.clipId);
+    if (placeholders.length) {
+      L('拼装过滤：' + all.length + ' 片 → 可用 ' + usable.length +
+        '（跳过 ' + placeholders.length + ' 个失败占位）');
+      const tree = {};
+      placeholders.forEach(p => { const d = p.depth || 0; tree[d] = (tree[d] || 0) + 1; });
+      L('  失败分布：' + Object.keys(tree).sort().map(d => 'd' + d + ':' + tree[d]).join(' '));
+    }
+
+    const sorted = usable.sort((a, b) => a.t0 - b.t0);
+    if (!sorted.length) throw new Error('没有可拼装的片段（全部失败）');
 
     /* 先算出每段的目标样本数（原始时间轴长度） */
     const ratio = Math.pow(2, PITCH / 12);
@@ -4104,7 +4119,10 @@ select.field{cursor:pointer}
           const r = await waitNetResume();
           if (r === 'skip') {
             log(pad + '（网络异常，跳过此段）');
-            return [];
+            return [{
+              clipId: null, t0, t1, semis: pitchSemis, depth,
+              status: 'split', reason: 'network-skip', origDur: dur,
+            }];
           }
         }
         /* ★ v47.2：上传前【不再做任何变速】
@@ -4152,6 +4170,7 @@ select.field{cursor:pointer}
           // origDur = 原始时长（场景长度）；audioDur = 存储时长；pad = 开头静音
           return [{
             clipId: up.clipId, t0, t1, semis, depth, tempoFactor: factor,
+            status: 'done',              // ★ v51
             origDur: dur,
             audioDur: storedDur,
             padDur: leadPad,
@@ -4168,17 +4187,48 @@ select.field{cursor:pointer}
         }
       }
 
-      if (depth >= MAX_DEPTH || dur / 2 < MIN_SEG) {
+      /* ★ v51：放弃时返回【占位切片】而不是空数组
+
+         照 sunouploader 的做法：父段保留在数据结构里，
+         只标记 status='split'，从不上传，拼装时过滤掉。
+
+         好处：
+           · 保留「这一段为什么没有」的信息
+           · 能还原完整的二分树
+           · 用户看到的是「已拆到第 N 层仍失败」，不是「凭空消失」 */
+      /* ★ v51 关键修复：二分的最小长度判断
+
+         踩坑：原来是 `dur / 2 < MIN_SEG`（MIN_SEG=6），
+              6 秒切片 / 2 = 3 秒 < 6 → 永远不二分！
+              实测日志一直是「✗ 放弃（已切 0 层）」，
+              说明这个二分机制从上线起就是【死代码】。
+
+         站点的做法（115 片真实数据）：
+              6 秒 → 3 秒 + 3 秒静音（补齐到 6 秒上传）
+              3 秒 → 1.5 秒 + 4.5 秒静音
+          即：内容可以很短，靠补静音满足 Suno 的 6 秒下限。
+
+         所以判断标准应该是「内容是否还值得拆」，
+         而不是「拆完是否还能达到 6 秒」。
+         用 MIN_CONTENT = 0.8 秒（再短就没意义了，且补静音的占比过高）。 */
+      const MIN_CONTENT = 0.8;
+      if (depth >= MAX_DEPTH || dur / 2 < MIN_CONTENT) {
         log(pad + '✗ 放弃（已切 ' + depth + ' 层，' + dur.toFixed(1) + 's）');
-        return [];
+        return [{
+          clipId: null, t0, t1, semis: pitchSemis, depth,
+          status: 'split',            // ★ 占位标记
+          reason: depth >= MAX_DEPTH ? 'max-depth' : 'too-short',
+          origDur: dur,
+        }];
       }
 
       const mid = (t0 + t1) / 2;
-      log(pad + '⇢ 二分 ' + dur.toFixed(1) + 's → 两段 ' + (dur / 2).toFixed(1) + 's');
+      log(pad + '⇢ 二分 ' + dur.toFixed(1) + 's → ' + (dur / 2).toFixed(1) + 's × 2（第 ' +
+          (depth + 1) + ' 层）');
       await sleep(500);
 
-      const left = await uploadWithBisect(t0, mid, depth + 1, label + 'a', pitchSemis, 2);
-      const right = await uploadWithBisect(mid, t1, depth + 1, label + 'b', pitchSemis, 2);
+      const left = await uploadWithBisect(t0, mid, depth + 1, label + '1', pitchSemis, 2);
+      const right = await uploadWithBisect(mid, t1, depth + 1, label + '2', pitchSemis, 2);
       return left.concat(right);
     }
 
@@ -4317,8 +4367,11 @@ select.field{cursor:pointer}
                   // 先入列再判断覆盖，避免自己看不到自己
                   const before = segDone(s);
                   pieces.push.apply(pieces, results);
+                  /* ★ v51：results 可能含 split 占位（clipId=null），
+                     取第一个有 clipId 的，别拿占位当成功 */
+                  const okResults = results.filter(p => p.clipId && p.status !== 'split');
                   results.forEach(p => { if (p.clipId) s.lastClipId = p.clipId });
-                  if (!s.clipId && results[0].clipId) s.clipId = results[0].clipId;
+                  if (!s.clipId && okResults.length) s.clipId = okResults[0].clipId;
 
                   if (segDone(s)) {
                     s.state = 'ok';
@@ -4372,8 +4425,9 @@ select.field{cursor:pointer}
               } catch (e) { log('[' + s.idx + '] 异常: ' + e.message) }
               if (results.length) {
                 pieces.push.apply(pieces, results);
+                const okR = results.filter(p => p.clipId && p.status !== 'split');
                 results.forEach(p => { if (p.clipId) s.lastClipId = p.clipId });
-                if (!s.clipId && results[0].clipId) s.clipId = results[0].clipId;
+                if (!s.clipId && okR.length) s.clipId = okR[0].clipId;
               }
               s.state = segDone(s) ? 'ok' : 'bad';
               if (segDone(s)) { log('[' + s.idx + '] ✓ 补上了'); doneSegs++ }
@@ -4411,13 +4465,23 @@ select.field{cursor:pointer}
           return;
         }
 
-        if (!pieces.length) { status('全部失败', 'err'); return; }
+        /* ★ v51：pieces 现在可能含 split 占位，要区分统计 */
+        const okPieces = pieces.filter(p => p.status !== 'split' && p.clipId);
+        const badPieces = pieces.filter(p => p.status === 'split' || !p.clipId);
+
+        if (!okPieces.length) { status('全部失败', 'err'); return; }
 
         pieces.sort((a, b) => a.t0 - b.t0);
 
         log('');
-        log('上传完成: ' + pieces.length + ' 块（原始 ' + total + ' 段，' + round + ' 轮）');
-        log('✓ 完整性校验通过：' + total + ' 段全部覆盖');
+        log('上传完成: ' + okPieces.length + ' 块（原始 ' + total + ' 段，' + round + ' 轮）');
+        if (badPieces.length) {
+          const lostSec = badPieces.reduce((a, p) => a + (p.t1 - p.t0), 0);
+          log('⚠ 有 ' + badPieces.length + ' 个占位未成功（涉及 ' +
+              (lostSec * Math.pow(2, PITCH / 12)).toFixed(1) + 's 原始时长），拼装时会跳过');
+        } else {
+          log('✓ 完整性校验通过：' + total + ' 段全部覆盖');
+        }
 
         setStep(4);
         let pid = null;
@@ -4432,6 +4496,23 @@ select.field{cursor:pointer}
             log('BPM 检测失败，沿用 bps ' + BPS);
           }
         } catch (e) { log('BPM 检测异常: ' + e.message + '，沿用 bps ' + BPS); }
+
+        /* ★ v51：打印完整二分树（照站点 index 小数编码的思路）
+           让用户看到：总共几片、成功几片、失败占位几片、分布在几层 */
+        {
+          const stats = { done: 0, split: 0, byDepth: {} };
+          pieces.forEach(p => {
+            const st = p.status || (p.clipId ? 'done' : 'split');
+            stats[st] = (stats[st] || 0) + 1;
+            const d = p.depth || 0;
+            stats.byDepth[d] = (stats.byDepth[d] || 0) + 1;
+          });
+          const depthStr = Object.keys(stats.byDepth).sort()
+            .map(d => 'd' + d + '=' + stats.byDepth[d]).join(' ');
+          log('切片统计：共 ' + pieces.length + ' 片，成功 ' + (stats.done || 0) +
+              '，失败占位 ' + (stats.split || 0) + '（' + depthStr + '）');
+        }
+
         /* ★ v47：不再用「分段」建 Studio 工程
 
            实测根因（213 秒歌 / 8 段）：
